@@ -1,0 +1,399 @@
+# Roblox Performance: Full Reference
+
+
+> **Code in this reference is illustrative. Adapt to your game and verify in Studio before production use.**
+
+Detailed performance targets, profiling guides, optimization patterns, and platform-specific guidance.
+
+## Starting Performance Targets
+
+These are investigation thresholds, not Roblox platform limits. Replace them
+with measurements from representative devices and your experience's workload.
+
+### Server
+| Metric | Starting target | Investigate at |
+|--------|-----------------|----------------|
+| Heartbeat time | < 16ms (60Hz) | > 33ms (below 30Hz) |
+| Script time | < 10ms/frame | > 20ms |
+| Memory | stable baseline | sustained growth |
+| Network out | measured baseline | congestion or latency |
+| DataStore budget | query `GetRequestBudgetForRequestType()` | low budget per request type |
+
+### Client
+| Metric | Starting target | Investigate at |
+|--------|-----------------|----------------|
+| FPS (desktop) | 60 | < 30 |
+| FPS (mobile) | 45 | < 30 |
+| Memory | stable device-tier baseline | sustained growth or OS termination |
+| Load time | < 10s to playable | > 20s |
+| Input latency | < 100ms | > 200ms |
+
+## Profiling Tools
+
+### MicroProfiler (Ctrl+F6)
+Per-frame breakdown of time spent in scripts, physics, rendering. The primary tool for finding what's actually slow.
+
+- Server: View → MicroProfiler
+- Client: Ctrl+F6 toggles the profiler; Ctrl+Alt+F6 opens its detailed timeline
+- Look for: long bars in "Script" category, physics spikes, render thread stalls
+
+Frame time converts to FPS by dividing 1,000 ms by frame time. These are the documented reference points (Roblox MicroProfiler docs):
+
+| Average frame time | Frames per second |
+|--------------------|-------------------|
+| 33.33 ms | 30 FPS |
+| 16.67 ms | 60 FPS |
+| 8.33 ms | 120 FPS |
+| 4.17 ms | 240 FPS |
+
+A high average is not the only failure mode: the docs stress **consistent** frame times, so a 16 ms average hiding periodic 40 ms spikes still reads as stutter to a player. Read the per-frame bars, not just the average.
+
+### Custom labels in the MicroProfiler
+
+The MicroProfiler is far more useful when hot paths carry their own labels. The `debug` library provides [debug.profilebegin](https://create.roblox.com/docs/en-us/reference/engine/libraries/debug) (opens a custom MicroProfiler label), `debug.profileend` (closes the most recent one), and `debug.setmemorycategory` (names a thread's memory usage in the Developer Console). They are cheap but not free, so gate them behind a flag that defaults off and wrap the calls so enabling is a one-line change:
+
+```luau
+local PROFILING = false -- flip during performance sessions
+
+local function begin(label: string)
+    if PROFILING then debug.profilebegin(label) end
+end
+local function finish()
+    if PROFILING then debug.profileend() end
+end
+```
+
+Pair `begin`/`finish` around each measured region (per-system updates, expensive queries, serialization), and set a memory category per long-lived thread so memory grouped under one script separates in the console. Labels must be balanced: every `profilebegin` needs exactly one `profileend`, on the same thread.
+
+### Developer Console (F9)
+- **Stats**: Memory, network, render stats
+- **Server Stats** (game owner): Server-side metrics
+- **Script Performance**: Per-script CPU time
+
+### Script Profiler (Ctrl+Alt+F5)
+- Per-script CPU usage and heap allocations
+- Identifies which scripts are hot
+
+## What Luau actually charges for (hot-loop cost model)
+
+The Scripts table above lists fixes; this section explains why they work so agents can generalize
+instead of cargo-culting. Everything here traces to [luau.org/performance](https://luau.org/performance)
+(the "How we make Luau fast" page) — ordering claims only; no absolute cycle counts are published.
+
+**Imports, not locals, kill global reads.** The compiler resolves global chains like `math.max` at
+*load time* ("imports") when the script's environment is pure, so `math.max(x, 1)` in a hot loop is
+already a constant-index fetch. `local max = math.max` buys nothing here — the Luau docs call
+caching method/library locals unproductive and discourage it. The habit that *does* matter:
+mutable globals cannot use the same load-time import assumption; their accesses can still be inline-cached. Keep per-script mutable state in locals or module-locals for clear ownership.
+
+**Environment impurity disables imports.** Calling `getfenv`, `setfenv`, or `loadstring` marks the affected environment *impure*, disabling import optimizations for functions using it
+— even read-only `getfenv` use, per the docs. `roblox-luau-core` flags these as isolation hazards;
+the performance reason to avoid them is that they deoptimize the whole module's global access and
+also disable `--!optimize 2` inlining entirely. Avoiding them is not style; it is keeping the
+compiler's optimizations armed.
+
+**Lookup shape matters; there is no universal cost ladder.** Luau inline-caches constant-key field access (`t.field` and constant `t["field"]`) when table shapes are stable. Direct fields avoid metatable lookup. Method calls have their own optimizations; do not replace engine `object:Method()` calls with cached functions mechanically. Builtin fastcalls are a separate case: `string.byte(s)` can use a fastcall whereas `s:byte()` cannot. Measure the actual workload before turning these mechanisms into a speed ranking.
+
+**Dead habits from Lua 5.1 training data:**
+- Hoisting `#list` out of `for i = 1, #list` — the loop bound is evaluated *once* at loop entry; the
+  hoist is noise. `#t` is also O(logN) worst case with cached length in Luau, not the Lua O(N) walk.
+- Hand unrolling loops — the compiler unrolls compile-time-bounded loops (`for i = 1, 4`) under
+  `--!optimize 2` with its own profitability heuristics, and inlines local functions the same way.
+  Hand unrolling fights the compiler and hurts readability; revisit whenever the optimization level
+  or build flags change.
+- `local f = math.floor` at module top — pure folklore in a clean environment (see imports above).
+
+**Allocation is a different cost axis, and the allocating frame is not the stalling frame.** Luau's
+GC is incremental and runs "assists" interleaved with script execution; a high allocation rate in one
+system shows up later as collector time attributed elsewhere, plus a periodic *atomic* step that can
+pause on the order of tens of milliseconds when it must traverse large recently-mutated structures
+(large weak tables and many active coroutines are the documented aggravators). So when the profiler
+shows GC cost rather than your function, hunt the allocation source, not the frame with the spike:
+
+```luau
+-- Illustrative: the consumer may read these views only until the next update.
+local results = {} -- retained across updates, not recreated every frame
+local function updateViews(entities)
+    for i, entity in entities do
+        local view = results[i]
+        if view == nil then
+            view = {} -- allocate once per active slot, not once per frame
+            results[i] = view
+        end
+        view.pos = entity.Position
+        view.hp = entity.Health
+    end
+    for i = #entities + 1, #results do
+        results[i] = nil -- discard inactive slots
+    end
+    return results
+end
+```
+
+Every slot has its own table; assigning one scratch table to every slot aliases all rows. This example changes the ownership contract: consumers must not retain views as immutable historical snapshots.
+
+The safety precondition for reuse (pools, scratch buffers, `table.clear`): nothing may retain the
+recycled object past the iteration. `table.create(n)` preallocates storage for known-size arrays;
+`table.clear` empties without freeing capacity. Closures and string concatenation are the other
+allocation sources: Luau caches closures with only immutable upvalues, but a closure with a mutated
+upvalue allocates per creation, and `s .. x` in a loop is a string object per iteration — use
+`table.concat` (the Scripts table row).
+
+**Measure, don't recite.** Every micro-optimization above costs readability. The MicroProfiler and
+Script Profiler (this skill's primary tools) decide whether any of it applies; an unmeasured hoist is
+cargo cult. For verifying that a change actually removed GC work rather than moving it, watch the
+Developer Console memory graph across a fixed-duration stress play session, and compare the
+MicroProfiler's GC/atomic bars before and after — not a single-frame snapshot.
+
+## Parallel Luau mechanics: Actors, messages, SharedTable
+
+Parallel Luau is a worker model, not a switch that makes an existing script faster. An `Actor`
+provides an isolation boundary for scripts that can run concurrently. The useful shape is usually:
+
+1. the serial coordinator gathers small, immutable inputs;
+2. workers perform expensive math, visibility tests, or simulation calculations;
+3. workers return raw results;
+4. the coordinator synchronizes and applies Roblox instance changes.
+
+Actors can run in different Luau VMs; do not rely on a one-Actor-to-one-VM mapping or on module-level state being shared across Actors. Communicate explicitly instead. Scripts under the same Actor execute sequentially relative to each other — parallelism comes
+from multiple Actors. `require()` cannot be called inside a desynchronized parallel phase; require
+modules in a serial context first.
+
+**Thread-safety tiers.** API members carry thread-safety tags in the reference pages: `Unsafe`
+(read/write or call forbidden in parallel — the default when untagged), `Read Parallel` (readable,
+not writable), `Local Safe` (usable within the owning Actor only), `Safe`. Parallel code that touches
+an Unsafe member is auto-detected and prevented by the engine. Before writing a parallel path, check
+the tags of every member it touches; "usually it works" is not a design.
+
+```luau
+local bindable = script.Parent:WaitForChild("Work")
+
+bindable.Event:ConnectParallel(function(input)
+    local result = expensivePureCalculation(input)
+
+    -- DataModel writes and other restricted operations belong back in serial.
+    task.synchronize()
+    script.Parent.Result.Value = result
+end)
+```
+
+The code above is illustrative. Keep the parallel section free of instance writes unless the current
+API explicitly permits the operation. Avoid moving a large mutable object graph between the
+coordinator and workers. Actor setup, synchronization, and contention can cost more than the work
+being offloaded.
+
+**Actor messaging (`Actor:SendMessage` / `BindToMessage` / `BindToMessageParallel`).** Messaging is
+asynchronous: the sender never blocks. `SendMessage(topic, ...)` targets exactly one Actor; that
+Actor may have multiple callbacks bound to one topic. Only executing scripts that are *descendants of the Actor* can bind. A module required by such a script can run in its Actor context; the module's storage location alone does not determine the caller context. `BindToMessage`
+invokes the callback in a serial context, `BindToMessageParallel` in a parallel one. Arguments are
+**passed by copy across the VM boundary** (ordinary message values are transferred across execution contexts): large tables are fully
+copied on every send, and functions cannot be sent at all because they belong to a specific VM. So
+message payloads must be plain data, Instance references, or SharedTable handles.
+
+**SharedTable: shared by reference, with atomics.** Sending a SharedTable through a message (or
+sharing one via `SharedTableRegistry`) does not copy it — updates by one Actor are immediately
+visible to all. Key/value restrictions (verified on the datatype page): keys must be strings or
+non-negative integers < 2³²; values may be booleans, numbers, vectors, strings, serializable
+datatypes, or nested SharedTables — **not Instances or functions** (both error on write). For
+read-modify-write without a serial phase, use the atomic primitives:
+
+```luau
+-- Counter-style state: prefer increment — docs note it is much faster than update
+local oldValue = SharedTable.increment(stats, "damageDealt", 1) -- errors if key missing/non-number
+
+-- Compound read-modify-write: update may call f MORE THAN ONCE under contention;
+-- f must be pure (no side effects, no captures you mutate), or retried runs double-apply.
+SharedTable.update(stats, "bestLap", function(best)
+    if lapTime < best then return lapTime end
+    return best
+end)
+
+-- Read-then-write through the element syntax is NOT atomic; another actor's write interleaves:
+local v = stats["x"]; stats["x"] = v .. ",x" -- the exact interleaving hazard the docs call out
+```
+
+**Snapshots: `clone` vs `cloneAndFreeze`.** A shallow `SharedTable.clone` is atomic and cheap
+(structural sharing — nested SharedTables stay shared), so it yields a consistent snapshot of one
+table even while others mutate it. A deep clone is **not** atomic as a whole: each nested table is
+snapshotted at a different instant, so a concurrently-mutated graph can clone inconsistently.
+`cloneAndFreeze` produces a read-only clone (writes error); frozen snapshots are the right way to
+hand workers a stable view of config or level data. SharedTable writes are distinct from DataModel writes. Before touching instances, check each member's thread-safety tag; synchronize for restricted operations. SharedTable is a data channel, not permission to bypass engine thread-safety restrictions.
+
+**When not to bother.** A message-per-frame pattern reintroduces the coordination cost you
+parallelized to avoid; batch per tick. Prefer more, logically-cohesive Actors over few overloaded
+ones (the docs recommend granularity for load balancing), but keep a unit of logic in one Actor.
+The practical rule is unchanged: profile first, isolate a pure or read-heavy calculation, compare
+against the serial version, and keep the parallel path only if the MicroProfiler shows a real win on
+target hardware.
+
+## Common Performance Issues
+
+### Scripts
+
+| Problem | Symptom | Fix |
+|---------|---------|-----|
+| Heartbeat loop over many instances | Server frame time spike | Event-driven or batch with yielding |
+| Repeated workspace lookups | Unnecessary overhead | Cache references in variables |
+| Table allocation in hot paths | GC pressure, frame spikes | Reuse preallocated tables |
+| String concatenation in loops | O(n²) allocation | `table.concat()` |
+| Signal over-subscription | Many listeners on one event | Batch or partition |
+| Unthrottled RenderStepped | Client FPS drop | Only use for camera/input, throttle everything else |
+| require() in loops | Repeated module resolution | Cache module reference outside loop |
+
+### Memory
+
+| Problem | Symptom | Fix |
+|---------|---------|-----|
+| Undisconnected events | Memory grows over time | Trove/Maid pattern, disconnect on cleanup |
+| Orphaned instances | Memory never freed | Destroy() instances, nil references |
+| Large tables never cleared | Lua GC can't collect | Set to nil or use weak tables |
+| Excessive cloning | Memory spikes on spawn | Object pooling |
+| Oversized images | High texture memory | Match resolution to on-screen size: at most 512x512 for large on-screen images, under 256x256 for minor ones, trim sheets for 3D reuse (docs) |
+
+Source for the image sizing guidance: https://create.roblox.com/docs/en-us/performance-optimization/improve (trim sheets, resolution-vs-screen-size rule). Uploaded images are transcoded by the platform, so "use a compressed format" is not a lever you control: the lever is resolution and reuse.
+
+#### Player/Character objects are NOT auto-destroyed
+
+`PlayerRemoving` and `CharacterRemoving` fire, but the engine does not destroy the Player or Character instances. If you hold attributes, connections, or references on them, that memory stays on the server for the life of the process, a slow leak that grows with every join/leave and eventually crashes long-lived servers.
+
+The pattern: disconnect/destroy each player's resources in those events, and destroy the instance when you are done with it. Defer the destroy (the removal event may still run cleanup) and wrap in `pcall` so cleanup can't error mid-list.
+
+```luau
+local Players = game:GetService("Players")
+
+local function destroyDeferred(instance: Instance)
+    task.defer(pcall, instance.Destroy, instance)
+end
+
+local function onCharacterRemoving(character: Model)
+    -- disconnect character-owned connections, clear attributes
+    destroyDeferred(character)
+end
+
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterRemoving:Connect(onCharacterRemoving)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    -- disconnect player-owned connections, clear attributes
+    destroyDeferred(player)
+    -- player is about to leave; no need to keep the object alive
+end)
+```
+
+Notes:
+- The same leak exists on the client (e.g. Player/character references from LocalScripts); clean up there too.
+- `Workspace.PlayerCharacterDestroyBehavior` (default `Disabled`) controls whether the engine destroys characters on removal. Even if set to destroy, don't rely on it for the Player object, and explicit cleanup is harmless.
+
+### Rendering
+
+| Problem | Symptom | Fix |
+|---------|---------|-----|
+| High part count | Low FPS, draw call bound | Merge static geometry, use MeshParts |
+| Transparent part stacking | Overdraw, GPU bound | Reduce layers, use CanvasGroup for UI |
+| Excessive particles | Mobile FPS death | Cap ParticleEmitter.Rate, reduce on mobile |
+| Too many dynamic lights | Frame time spike | Documented guidance is simply "use fewer dynamic lights"; the 4-6 per area figure is a practitioner heuristic, not an engine limit. Measure before enforcing |
+| Post-processing stacking | GPU overhead | One BloomEffect, one ColorCorrection max |
+
+### Network
+
+| Problem | Symptom | Fix |
+|---------|---------|-----|
+| Frequent RemoteEvent fires | Bandwidth spike | Batch updates into one event per tick. The 10-20/sec throttle figure is a practitioner heuristic: pick the rate from measured bandwidth and gameplay tolerance, not a rule |
+| Large payloads | Lag spike on fire | Send IDs not full objects, compress data |
+| Replicating unnecessary instances | Join time slow | Keep Workspace lean, use ServerStorage |
+| Unthrottled property changes | Network saturation | Batch property changes, use attributes |
+
+### Replay / Delta State Recording
+
+A replay system stores compact per-delta state changes rather than full frames: record only the authoritative fields that change each tick (CFrame, velocity, health, anim), delta/dict-encode against the prior frame, then compress (e.g. ZStd) and chunk the stream for storage. Store an integrity hash (e.g. HMAC-SHA256) so chunks can't be tampered with, and version the protocol so older replays stay decodeable as the format evolves. Reconstruction happens at playback on the client, keeping the stored footprint near the delta+compression size rather than raw per-frame snapshots. [Community lead: "ReplayCore" by lathienvu7, https://devforum.roblox.com/t/replaycore-a-modern-open-source-replay-system-for-roblox/4803450; label as practitioner design and verify specifics before adoption.]
+
+## Optimization Patterns
+
+Code-level micro-optimizations (object pooling, throttled updates,
+distance-based relevance filtering, lazy loading) now live in
+`roblox-luau-patterns` §10. Apply them only where the profiler shows cost.
+The engine-side counterparts stay in this skill: StreamingEnabled tuning and
+detect-platform guidance are under Mobile-Specific Optimization below.
+
+## Mobile-Specific Optimization
+
+Optimize for representative low-end mobile devices, not universal object caps:
+
+- **Geometry**: Profile visible parts and triangles; use StreamingEnabled where appropriate.
+- **Textures**: Match resolution to on-screen size and inspect texture memory.
+- **Particles**: Measure active particle cost and reduce rate/lifetime on constrained devices.
+- **UI**: Profile hierarchy and `CanvasGroup` use; CanvasGroup itself has rendering cost.
+- **Shadows**: Profile lighting and shadow settings on each target tier.
+- **Streaming**: Tune radii in Studio against pop-in, memory, and bandwidth.
+
+### StreamingEnabled
+
+StreamingEnabled is **on by default** for new places. Scoping is container-based: streaming applies exclusively to descendants of `Workspace`. Instances in `ReplicatedStorage`, `ReplicatedFirst`, etc. never stream.
+
+With `ModelStreamingBehavior = Improved` (recommended), a Model streams in only when one of its BasePart descendants is eligible, and the model's non-BasePart descendants (Folders, Scripts, ValueObjects) stream in alongside it. A Model with no BasePart descendants replicates at join and is exempt from streaming out. In Legacy mode (default), non-BasePart descendants replicate at join and only BaseParts stream in/out.
+
+When instances stream out, they are **parented to nil** (not destroyed). Luau references persist if they stream back in. Removal signals fire, but local-only property changes may be lost.
+
+Configuration:
+- `StreamingTargetRadius`: maximum target distance; Studio default is 1024 studs.
+- `StreamingMinRadius`: highest-priority radius; Studio default is 64 studs.
+- `StreamingIntegrityMode`: behavior when a player enters an incompletely streamed region.
+
+These settings are not scriptable. Tune them in Studio from measurements on
+representative devices; do not assume a smaller radius is automatically better.
+
+**Gotcha**: `workspace:FindFirstChild("DistantPart")` returns nil if the part is streamed out. Use `WaitForChild` with timeout, or design systems that don't depend on distant parts existing on the client.
+
+### Predictive Streaming (2026-07)
+
+`Workspace.PredictiveStreamingMode` is Studio-only and not scriptable. `Default` currently behaves like `Disabled`; `Enabled` lets the engine prefetch likely destinations for streaming-enabled experiences.
+
+Spawn prefetching creates small temporary streaming foci at possible respawn locations after a player dies. CFrame return optimization keeps the area a player just left streamed in for a likely near-term return. Predictions are additive and temporary, so remeasure memory and bandwidth on representative devices.
+
+### Detect Platform
+
+```luau
+local UserInputService = game:GetService("UserInputService")
+
+local isMobile = UserInputService.TouchEnabled
+    and not UserInputService.KeyboardEnabled
+
+if isMobile then
+    -- StreamingEnabled is set in Studio (ReadOnly from scripts).
+    -- Reduce particle counts, disable expensive effects
+end
+```
+
+## Performance Budget Template
+
+Illustrative allocation for a 60 FPS target. Replace every number with measured
+project budgets before enforcing it:
+
+```
+SERVER BUDGET (per Heartbeat frame, 16ms total):
+  Physics:     4ms
+  Scripts:     8ms
+  Replication: 2ms
+  Overhead:    2ms
+
+CLIENT BUDGET (per render frame, 16ms for 60fps):
+  Render:      8ms
+  Scripts:     4ms
+  Physics:     2ms
+  UI:          1ms
+  Overhead:    1ms
+
+MEMORY BUDGET:
+  Set per tested device tier; watch sustained growth and OS termination.
+
+NETWORK BUDGET:
+  Set from measured gameplay traffic and latency; rate-limit per action semantics.
+```
+
+## Community ecosystem (leads, not sources)
+
+- [Connections can memory leak Instances](https://devforum.roblox.com/t/psa-connections-can-memory-leak-instances/90082): the RBXScriptSignal leak PSA every reviewer cites; [GC and memory leaks](https://devforum.roblox.com/t/garbage-collection-and-memory-leaks-in-roblox-what-you-should-know/374954).
+- [How to actually improve performance](https://devforum.roblox.com/t/improved-how-to-actually-improve-performance-in-your-games/1221842) (measure-first canon); [6000+ FPS game](https://devforum.roblox.com/t/creating-the-most-optimized-roblox-game-runs-at-6000-fps/1736424) extreme case.
+- [Luau Bytecode EXPLAINED](https://devforum.roblox.com/t/luau-bytecode-explained-how-to-read-debug-and-optimize-like-a-hacker/3941941) (2025) and [Illegal Luau optimizations](https://devforum.roblox.com/t/%E2%96%A8-how-2-make-roblox-engineers-cry-illegal-luau-optimizations-and-how-to-use-them/4128934) (2025): compiler-level perf literacy.
+- [Dynamic culling system](https://devforum.roblox.com/t/advanced-modular-dynamic-culling-system/4322958) (2026); [DistanceFade](https://devforum.roblox.com/t/distancefade-a-transparency-falloff-effect-for-your-games/3136828); [greedy meshing](https://devforum.roblox.com/t/consume-everything-how-greedy-meshing-works/452717).
