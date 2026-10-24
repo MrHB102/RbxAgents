@@ -17,7 +17,7 @@ const id = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/)
 const short = z.string().trim().min(1).max(200)
 const agentSchema = z.object({
   id, name: short, role: short, description: z.string().max(2000), color: z.string().regex(/^#[a-fA-F0-9]{6}$/),
-  providerId: z.string().max(100), model: z.string().max(200), systemPrompt: z.string().max(100_000), skillIds: z.array(id).max(300), mcpIds: z.array(id).max(30), enabled: z.boolean(), permission: z.enum(['ask', 'read-only']), maxSteps: z.number().int().min(1).max(100)
+  providerId: z.string().max(100), model: z.string().max(200), systemPrompt: z.string().max(100_000), skillIds: z.array(id).max(300), mcpIds: z.array(id).max(30), enabled: z.boolean(), permission: z.enum(['ask', 'read-only', 'unrestricted']), maxSteps: z.number().int().min(1).max(100), tokenBudget: z.number().int().min(1000).max(1_000_000).default(30_000)
 })
 const providerSchema = z.object({ id, name: short, kind: z.enum(['openai', 'anthropic', 'chatgpt']), baseUrl: z.string().max(2000), apiKey: z.string().max(20_000).optional(), models: z.array(z.string().max(200)).max(1000).default([]) })
 const serverSchema = z.object({ id, name: short, transport: z.enum(['bundled', 'stdio', 'http', 'sse']), command: z.string().max(4000), args: z.array(z.string().max(4000)).max(100), url: z.string().max(2000), env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string().max(4000)), pluginDirectory: z.string().max(4000), token: z.string().max(20_000).optional() })
@@ -71,6 +71,7 @@ async function action(name: string, payload: unknown): Promise<unknown> {
       if (agent.mcpIds.some(serverId => !store.state.servers.some(s => s.id === serverId))) throw new Error('An enabled MCP server no longer exists.')
       const index = store.state.agents.findIndex(a => a.id === agent.id)
       if (index < 0) store.state.agents.push(agent); else store.state.agents[index] = agent
+      runtime.setAccess(agent.id, agent.permission)
       store.save(); return agent
     }
     case 'agent:delete': {

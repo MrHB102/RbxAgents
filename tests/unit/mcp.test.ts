@@ -15,6 +15,11 @@ it('connects to a real stdio MCP process and serializes overlapping agent reques
     expect(store.state.servers.find(s => s.id === 'fixture')?.tools.map(t => t.name)).toEqual(['sequence_probe'])
     const result = await Promise.all([manager.call('fixture', 'sequence_probe', {}), manager.call('fixture', 'sequence_probe', {})])
     expect((result[1] as any).content[0].text).toBe('["start:1","end:1","start:2","end:2"]')
+    const inFlight = manager.call('fixture', 'sequence_probe', {})
+    const queued = manager.call('fixture', 'sequence_probe', {}, undefined, () => { throw new Error('Access was revoked while queued.') })
+    const blocked = expect(queued).rejects.toThrow('Access was revoked')
+    await inFlight
+    await blocked
     await manager.disconnect('fixture')
     expect(store.state.servers.find(s => s.id === 'fixture')?.status).toBe('disconnected')
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }) }

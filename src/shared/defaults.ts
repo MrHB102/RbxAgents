@@ -8,7 +8,7 @@ Read before writing. Make bounded changes, read them back, and verify in a playt
 Keep gameplay authority on the server. Validate all client input. Prefer typed Luau and clean module boundaries.
 Never claim you tested or changed anything without tool evidence. Clearly explain failures and missing connections.
 Use load_skill to read relevant installed skills and their reference files as needed.
-Publishing, purchases, persistent data migrations, and destructive changes require explicit user approval.`
+Follow the agent's active access mode for tool approvals. Keep responses concise and load only the knowledge needed for the task.`
 
 const definitions = [
   ['Architect', 'Architecture & planning', 'Turns ideas into maintainable Roblox systems, with clear boundaries and a practical plan.', '#bd93f9', 'Design the architecture, inspect existing systems, and provide a concrete implementation plan. Prefer small modules with explicit ownership.', ['roblox-architecture', 'roblox-luau-types', 'roblox-networking']],
@@ -20,7 +20,7 @@ const definitions = [
 export function defaultAgents(): Agent[] {
   return definitions.map(([name, role, description, color, systemPrompt, skills]) => ({
     id: name.toLowerCase(), name, role, description, color, systemPrompt, skillIds: ['roblox-collaboration-mode', ...skills],
-    providerId: '', model: '', mcpIds: ['roblox'], enabled: true, permission: name === 'Reviewer' ? 'read-only' : 'ask', maxSteps: 20
+    providerId: '', model: '', mcpIds: ['roblox'], enabled: true, permission: name === 'Reviewer' ? 'read-only' : 'ask', maxSteps: 8, tokenBudget: 30_000
   }))
 }
 export function initialState(hostId: string): AppState {

@@ -1,13 +1,13 @@
 # Verification record
 
-Date: October 23, 2026. Host: Windows x64. Application version: 0.1.0.
+Date: October 23, 2026. Host: Windows x64. Application version: 0.1.1.
 
 ## Automated checks
 
 | Check | Result | Coverage |
 | --- | --- | --- |
 | TypeScript | Passed | Main process, preload, renderer, and test sources |
-| Unit and integration tests | 18 passed | Complete skill library, path boundaries, credential fallback, restart recovery, fragmented UTF-8/SSE, provider URLs, mutation approval/denial, cancellation, read-only tools, OAuth state/PKCE/identity checks, serialized token refresh, and a real stdio MCP process with queued concurrent calls |
+| Unit and integration tests | 30 passed | Prior coverage plus unrestricted execution, live access-mode changes, compact context with paired tool results, deferred tool discovery, paged references, usage/cache accounting, budget limits, and authorization guards for queued MCP calls |
 | Electron desktop test | Passed | Visible navigation, all 29 skills, full references, API connection form, model discovery, agent configuration, streaming tool loop, activity, prompt editing, persistence after restart, secret exclusion, and actual plugin installation into a temporary directory |
 | Packaged Windows x64 smoke test | Passed | Production renderer, starter agents, all bundled skills, isolated user data directory, and the packaged MCP plugin installer |
 | Windows installers | Built | Individual x64 and ARM64 installers plus a combined installer; unsigned. The two architecture payloads contain identical application ASAR hashes. |

@@ -84,7 +84,7 @@ export class McpManager {
     if (!server) throw new Error('MCP server not found.')
     return server
   }
-  async call(id: string, name: string, args: Record<string, unknown>, signal?: AbortSignal) {
+  async call(id: string, name: string, args: Record<string, unknown>, signal?: AbortSignal, guard?: () => void) {
     // Serialize calls across agents to prevent interleaved mutations in one Studio.
     const previous = this.queues.get(id) || Promise.resolve()
     const pending = previous.catch(() => {}).then(async () => {
@@ -93,6 +93,7 @@ export class McpManager {
       signal?.throwIfAborted()
       const client = this.clients.get(id)
       if (!client) throw new Error('MCP bridge disconnected.')
+      guard?.()
       return client.callTool({ name, arguments: args }, undefined, { timeout: 120_000, signal })
     })
     this.queues.set(id, pending)

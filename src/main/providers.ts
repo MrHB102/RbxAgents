@@ -6,7 +6,9 @@ import { checkedFetch, sseEvents, validateEndpoint } from './http'
 export interface ToolSpec { name: string; description: string; parameters: Record<string, unknown> }
 export interface ToolCall { id: string; name: string; arguments: string }
 export interface Turn { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]; tool_call_id?: string }
-export interface TurnResult { text: string; calls: ToolCall[]; tokens: number }
+export interface TokenUsage { inputTokens: number; outputTokens: number; cachedInputTokens: number }
+export interface TurnResult { text: string; calls: ToolCall[]; tokens: number; usage?: TokenUsage }
+export interface TurnOptions { maxOutputTokens: number }
 
 export class Providers {
   constructor(private store: Store, private auth: ChatGPTAuth) {}
@@ -25,18 +27,20 @@ export class Providers {
     if (!models.length) throw new Error('The provider returned no available models. Check the endpoint and account permissions.')
     return models
   }
-  async turn(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void): Promise<TurnResult> {
-    if (provider.kind === 'anthropic') return this.anthropic(provider, model, turns, tools, signal, delta)
-    if (provider.kind === 'chatgpt') return this.responses(provider, model, turns, tools, signal, delta)
+  async turn(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void, options: TurnOptions = { maxOutputTokens: 4096 }): Promise<TurnResult> {
+    if (provider.kind === 'anthropic') return this.anthropic(provider, model, turns, tools, signal, delta, options)
+    if (provider.kind === 'chatgpt') return this.responses(provider, model, turns, tools, signal, delta, options)
     const response = await checkedFetch(`${validateEndpoint(provider.baseUrl)}/chat/completions`, {
       method: 'POST', headers: await this.headers(provider), signal,
-      body: JSON.stringify({ model, messages: turns, stream: true, ...(tools.length ? { tools: tools.map(t => ({ type: 'function', function: t })) } : {}) })
+      body: JSON.stringify({ model, messages: turns, stream: true, stream_options: { include_usage: true }, ...(new URL(provider.baseUrl).hostname === 'api.openai.com' ? { max_completion_tokens: options.maxOutputTokens } : { max_tokens: options.maxOutputTokens }), ...(tools.length ? { tools: tools.map(t => ({ type: 'function', function: t })) } : {}) })
     })
     let text = '', tokens = 0, finished = false
+    const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 }
     const calls = new Map<number, ToolCall>()
     for await (const event of sseEvents(response)) {
       if (event.error) throw new Error(event.error.message || 'The provider returned an error.')
       tokens = event.usage?.total_tokens || tokens
+      if (event.usage) { usage.inputTokens = event.usage.prompt_tokens || 0; usage.outputTokens = event.usage.completion_tokens || 0; usage.cachedInputTokens = event.usage.prompt_tokens_details?.cached_tokens || 0 }
       const choice = event.choices?.[0]
       if (choice?.finish_reason) { if (choice.finish_reason === 'length' || choice.finish_reason === 'content_filter') throw new Error(`Response stopped: ${choice.finish_reason}`); finished = true }
       if (choice?.delta?.content) { text += choice.delta.content; delta(choice.delta.content) }
@@ -49,9 +53,9 @@ export class Providers {
       }
     }
     if (!finished) throw new Error('The provider stream ended before a completion was confirmed.')
-    return { text, calls: [...calls.values()], tokens }
+    return { text, calls: [...calls.values()], tokens, usage }
   }
-  private async responses(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void): Promise<TurnResult> {
+  private async responses(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void, options: TurnOptions): Promise<TurnResult> {
     const input = turns.filter(t => t.role !== 'system').flatMap(t => {
       if (t.role === 'tool') return [{ type: 'function_call_output', call_id: t.tool_call_id, output: t.content }]
       const messages: Record<string, unknown>[] = t.content ? [{ role: t.role, content: t.content }] : []
@@ -59,19 +63,20 @@ export class Providers {
       return messages
     })
     const response = await checkedFetch('https://api.openai.com/v1/responses', { method: 'POST', headers: await this.headers(provider), signal,
-      body: JSON.stringify({ model, instructions: turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'), input, stream: true, store: false, ...(tools.length ? { tools: tools.map(t => ({ type: 'function', ...t, strict: false })) } : {}) }) })
+      body: JSON.stringify({ model, instructions: turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'), input, stream: true, store: false, max_output_tokens: options.maxOutputTokens, ...(tools.length ? { tools: tools.map(t => ({ type: 'function', ...t, strict: false })) } : {}) }) })
     let text = '', tokens = 0, completed = false
+    const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 }
     const calls: ToolCall[] = []
     for await (const event of sseEvents(response)) {
       if (event.type === 'response.output_text.delta') { text += event.delta; delta(event.delta) }
       if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') calls.push({ id: event.item.call_id, name: event.item.name, arguments: event.item.arguments })
-      if (event.type === 'response.completed') { completed = true; tokens = event.response?.usage?.total_tokens || 0 }
+      if (event.type === 'response.completed') { completed = true; tokens = event.response?.usage?.total_tokens || 0; usage.inputTokens = event.response?.usage?.input_tokens || 0; usage.outputTokens = event.response?.usage?.output_tokens || 0; usage.cachedInputTokens = event.response?.usage?.input_tokens_details?.cached_tokens || 0 }
       if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) throw new Error(event.response?.error?.message || event.error?.message || event.message || 'ChatGPT could not complete the response. Check your plan usage and account connection.')
     }
     if (!completed) throw new Error('ChatGPT stream ended without response.completed.')
-    return { text, tokens, calls }
+    return { text, tokens, calls, usage }
   }
-  private async anthropic(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void): Promise<TurnResult> {
+  private async anthropic(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void, options: TurnOptions): Promise<TurnResult> {
     const messages: { role: string; content: Record<string, unknown>[] }[] = []
     for (const turn of turns.filter(t => t.role !== 'system')) {
       if (turn.role === 'tool') {
@@ -85,12 +90,17 @@ export class Providers {
       }
     }
     const response = await checkedFetch(`${validateEndpoint(provider.baseUrl)}/messages`, { method: 'POST', headers: await this.headers(provider), signal,
-      body: JSON.stringify({ model, system: turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'), messages, max_tokens: 8192, stream: true, ...(tools.length ? { tools: tools.map(t => ({ name: t.name, description: t.description, input_schema: t.parameters })) } : {}) }) })
+      body: JSON.stringify({ model, system: turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'), messages, max_tokens: options.maxOutputTokens, stream: true, ...(tools.length ? { tools: tools.map(t => ({ name: t.name, description: t.description, input_schema: t.parameters })) } : {}) }) })
     let text = '', tokens = 0, completed = false
+    const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 }
     const calls = new Map<number, ToolCall>()
     for await (const event of sseEvents(response)) {
       if (event.type === 'error') throw new Error(event.error?.message || 'Claude returned an error.')
-      if (event.type === 'message_start') tokens += event.message?.usage?.input_tokens || 0
+      if (event.type === 'message_start') {
+        usage.cachedInputTokens = event.message?.usage?.cache_read_input_tokens || 0
+        usage.inputTokens = (event.message?.usage?.input_tokens || 0) + usage.cachedInputTokens + (event.message?.usage?.cache_creation_input_tokens || 0)
+        usage.outputTokens = event.message?.usage?.output_tokens || 0
+      }
       if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') calls.set(event.index, { id: event.content_block.id, name: event.content_block.name, arguments: '' })
       if (event.type === 'content_block_delta') {
         if (event.delta?.text) { text += event.delta.text; delta(event.delta.text) }
@@ -98,11 +108,12 @@ export class Providers {
       }
       if (event.type === 'message_delta') {
         if (['max_tokens', 'refusal'].includes(event.delta?.stop_reason)) throw new Error(`Claude stopped: ${event.delta.stop_reason}`)
-        tokens += event.usage?.output_tokens || 0
+        usage.outputTokens = event.usage?.output_tokens ?? usage.outputTokens
       }
       if (event.type === 'message_stop') completed = true
     }
     if (!completed) throw new Error('Claude stream ended before message_stop.')
-    return { text, tokens, calls: [...calls.values()].map(c => ({ ...c, arguments: c.arguments || '{}' })) }
+    tokens = usage.inputTokens + usage.outputTokens
+    return { text, tokens, usage, calls: [...calls.values()].map(c => ({ ...c, arguments: c.arguments || '{}' })) }
   }
 }

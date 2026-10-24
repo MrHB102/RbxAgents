@@ -23,7 +23,8 @@ Built with a clean Dracula-inspired interface, a complete Roblox skill library, 
 - **Set their instructions.** Combine a workspace system prompt, individual agent instructions, and selected skills.
 - **Use all 29 Roblox skills offline.** The complete [roblox-brain](https://github.com/tabooharmony/roblox-brain) library ships with the app, including every `references/full.md`. Import additional local skill collections.
 - **Connect directly to Studio.** The [Chrrxs Roblox Studio MCP](https://github.com/Chrrxs/robloxstudio-mcp) server and matching plugin are bundled. Install the plugin from inside the app without a separate Node.js installation.
-- **Keep control of changes.** Approve individual mutation calls, deny them, stop a run, or give an agent read-only access. Calls to the same MCP server are serialized across agents.
+- **Choose an access mode.** Use Ask before changes, Read only, or **Unrestricted access** to execute tools without approval prompts. Calls to the same MCP server are serialized across agents.
+- **Spend fewer tokens.** Discover MCP tools on demand, load paged skill references, keep bounded context, and set a token budget for each message.
 - **Keep your context.** Conversations, agent settings, token counts reported by providers, and recent activity are stored locally. Export agent definitions and the workspace prompt without credentials.
 
 RBX Agents is a functional desktop preview. See [Current limitations](#current-limitations) for the verification and platform boundaries.
@@ -63,6 +64,24 @@ A connected MCP bridge does not by itself mean that a Studio place is connected.
 For a planning-only conversation, turn off the agent’s MCP connections in **Configure → Connections**. This allows the agent to work without Studio running.
 
 ## Providers and authentication
+
+### Economy mode and token usage
+
+Version 0.1.1 uses economy context handling by default, including for existing agents:
+
+- The model receives a small `search_tools` / `call_tool` interface instead of every connected MCP tool definition on every request. Exact tool schemas are discovered only when needed.
+- All 29 skills remain installed. Skill instructions and references are loaded in pages of up to 5,000 characters, and duplicate pages already in context are not loaded again.
+- Tool results are capped at 6,000 characters. Binary image/audio output is omitted from text context.
+- Serialized model context and tool definitions are limited to 36,000 characters per request. Old exchanges and complete old tool rounds are removed locally when needed, without a paid summarization request. The current user request is preserved; oversized instructions fail before inference.
+- The default budget is **30,000 total tokens per message**, across all its model requests. Change it under **Configure agent → Token budget per message**. Input estimates are checked before sending another request. An in-flight request can exceed the remaining estimate; this is not a billing guarantee.
+- Output is capped at 4,096 tokens per request, or a smaller remaining allowance. New agents default to eight model steps; existing agents retain their configured step limit.
+- The conversation inspector separates **Conversation tokens**, **Last run tokens**, model request count, approximate context size, and cached input. Cached input is part of the reported input total, not an extra charge added by the app. Estimates are labeled when provider usage is unavailable.
+
+Opening the app or creating a conversation does not start model inference. Inference starts only when you send a message. The conversation total is cumulative and can include earlier runs; it is not startup usage or a price estimate. Actual plan consumption and billing depend on your provider. See [OpenAI’s prompt-caching documentation](https://developers.openai.com/api/docs/guides/prompt-caching) for the distinction between input, cached input, and cache writes.
+
+### Unrestricted access
+
+Open **Agents → Configure → Permissions → Unrestricted access**, then save. The agent runs its available MCP tools without application approval prompts, including writes. Switching to this mode also releases pending application approvals for that agent. Switching to Read only blocks subsequent mutations. Provider permissions, MCP server restrictions, Stop, step limits, and token budgets still apply.
 
 | Connection | Authentication | Inference API |
 | --- | --- | --- |
@@ -197,7 +216,7 @@ resources/     Complete bundled Roblox skill library and attribution
 tests/         Unit tests and Electron desktop integration tests
 ```
 
-Independent agent conversations can run concurrently. Each uses a snapshot of its agent configuration at start. The runtime supports bounded model/tool loops, per-call approvals, cancellation, and explicit failures on incomplete provider streams. Studio calls to the same MCP server are queued to prevent interleaved actions.
+Independent agent conversations can run concurrently. Each uses a snapshot of its agent configuration at start; access-mode changes also apply to active runs. The runtime supports bounded model/tool loops, the selected access mode, cancellation, and explicit failures on incomplete provider streams. Studio calls to the same MCP server are queued to prevent interleaved actions.
 
 ## Current limitations
 

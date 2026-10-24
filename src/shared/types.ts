@@ -6,7 +6,7 @@ export interface Provider {
 export interface Agent {
   id: string; name: string; role: string; description: string; color: string; providerId: string
   model: string; systemPrompt: string; skillIds: string[]; mcpIds: string[]; enabled: boolean
-  permission: 'ask' | 'read-only'; maxSteps: number
+  permission: 'ask' | 'read-only' | 'unrestricted'; maxSteps: number; tokenBudget?: number
 }
 export interface Skill { id: string; name: string; description: string; category: string; source: string; path: string; builtin: boolean }
 export interface McpServer {
@@ -16,7 +16,8 @@ export interface McpServer {
 }
 export interface McpTool { name: string; description: string; inputSchema: Record<string, unknown>; readOnly: boolean }
 export interface Message { id: string; role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt: string }
-export interface Session { id: string; agentId: string; title: string; messages: Message[]; createdAt: string; updatedAt: string; tokens: number; status: 'idle' | 'running' | 'waiting' | 'error' }
+export interface RunUsage { tokens: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; requests: number; contextCharacters: number; budget: number; estimated: boolean }
+export interface Session { id: string; agentId: string; title: string; messages: Message[]; createdAt: string; updatedAt: string; tokens: number; lastRun?: RunUsage; status: 'idle' | 'running' | 'waiting' | 'error' }
 export interface Activity { id: string; time: string; kind: 'info' | 'success' | 'error' | 'tool'; title: string; detail: string; agentId?: string }
 export interface Approval { id: string; sessionId: string; agentId: string; serverId: string; tool: string; args: Record<string, unknown> }
 export interface AppState {
