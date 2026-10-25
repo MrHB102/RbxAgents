@@ -44,7 +44,8 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   const errors: string[] = []
   page.on('pageerror', error => errors.push(error.message))
   await expect(page.getByRole('heading', { name: 'Your team, in sync.' })).toBeVisible({ timeout: 20_000 })
-  await expect(page.locator('.agent-card')).toHaveCount(4)
+  await expect(page.locator('.agent-card')).toHaveCount(5)
+  await expect(page.locator('.agent-card').filter({ has: page.getByRole('heading', { name: 'Master', exact: true }) })).toContainText('Orchestrator')
   await expect(page.getByText('29 skills installed')).toBeVisible()
   await page.screenshot({ path: 'test-results/agents-desktop.png' })
   // Every upstream skill and reference can be read through the hardened preload bridge.
@@ -88,6 +89,15 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   expect(requests[0].tools).toHaveLength(1)
   expect(requests[0].messages[0].content).toContain('server')
   expect(requests[1].messages.some((m: any) => m.role === 'tool' && m.content.includes('Architecture'))).toBe(true)
+  // Slash commands: suggestions appear, and commands never reach the model.
+  const composer = page.getByRole('textbox', { name: 'Message your agent' })
+  await composer.fill('/ef')
+  await expect(page.getByRole('listbox', { name: 'Commands' })).toContainText('/effort')
+  await composer.fill('/effort high')
+  await page.getByRole('button', { name: 'Send message', exact: true }).click()
+  await expect(page.locator('.system-message.command')).toContainText('Effort: high')
+  await expect(page.getByLabel('Reasoning effort')).toHaveValue('high')
+  expect(requests).toHaveLength(2)
   await page.screenshot({ path: 'test-results/conversation-desktop.png' })
   // Prompt editing and activity reflect actual run state.
   await page.getByRole('button', { name: 'System prompts', exact: true }).click()

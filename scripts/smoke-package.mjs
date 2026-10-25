@@ -16,7 +16,7 @@ try {
   const snapshot = await page.evaluate(() => window.rbx.invoke('state'))
   assert.equal(snapshot.appVersion, JSON.parse(readFileSync('package.json', 'utf8')).version)
   assert.equal(snapshot.skills.filter(skill => skill.builtin).length, 29)
-  assert.equal(snapshot.agents.length, 4)
+  assert.equal(snapshot.agents.length, 5)
   const agent = await page.evaluate(config => window.rbx.invoke('agent:save', config), { ...snapshot.agents[0], permission: 'unrestricted', tokenBudget: 30_000 })
   assert.equal(agent.permission, 'unrestricted')
   assert.equal(agent.tokenBudget, 30_000)

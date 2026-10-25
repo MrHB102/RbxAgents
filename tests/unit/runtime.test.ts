@@ -10,7 +10,7 @@ import type { McpManager } from '../../src/main/mcp'
 function fixture(readOnly = false, unrestricted = false) {
   const directory = mkdtempSync(join(tmpdir(), 'rbx-runtime-'))
   const store = new Store(directory, { available: () => false, encrypt: () => Buffer.alloc(0), decrypt: () => '' })
-  const agent = store.state.agents[0]
+  const agent = store.state.agents.find(a => a.id === 'architect')!
   agent.providerId = 'local'; agent.model = 'test-model'; agent.permission = readOnly ? 'read-only' : unrestricted ? 'unrestricted' : 'ask'
   store.state.providers.push({ id: 'local', name: 'Local', kind: 'openai', baseUrl: 'http://localhost:1234/v1', models: ['test-model'], hasKey: false, status: 'connected' })
   const server = store.state.servers[0]
@@ -118,7 +118,7 @@ describe('agent tool permissions', () => {
   })
   it('stops before another model request when the run budget is consumed', async () => {
     const { store, runtime, turn, cleanup } = fixture(false, true)
-    store.state.agents[0].tokenBudget = 10_000
+    store.state.agents.find(a => a.id === 'architect')!.tokenBudget = 10_000
     turn.mockImplementation(async () => ({ text: '', tokens: 10_000, calls: [{ id: 'call', name: 'search_tools', arguments: '{"query":"execute_luau"}' }] }))
     try {
       await runtime.send('session', 'Make the change.')

@@ -1,7 +1,7 @@
 import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { initialState } from '../shared/defaults'
+import { initialState, migrate } from '../shared/defaults'
 import type { AppState, Activity, RuntimeState } from '../shared/types'
 
 export interface SecretCodec { available(): boolean; encrypt(value: string): Buffer; decrypt(value: Buffer): string }
@@ -19,6 +19,7 @@ export class Store {
       try {
         const saved = JSON.parse(readFileSync(this.path, 'utf8')) as AppState
         if (saved.version !== 1 || !Array.isArray(saved.agents) || !Array.isArray(saved.sessions) || !Array.isArray(saved.providers) || !saved.settings) throw new Error('Invalid workspace')
+        migrate(saved)
         this.state = saved
       } catch {
         copyFileSync(this.path, `${this.path}.recovery-${Date.now()}`)

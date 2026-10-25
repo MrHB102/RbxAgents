@@ -18,7 +18,9 @@ Built with a clean Dracula-inspired interface, a complete Roblox skill library, 
 
 ## What you can do
 
-- **Build your team.** Create, duplicate, pause, and configure agents. Start with Architect, Builder, Scripter, and Reviewer.
+- **Build your team.** Create, duplicate, pause, and configure agents. Start with a Master, Architect, Builder, Scripter, and Reviewer.
+- **Let a Master Agent run the team.** The Master plans, delegates self-contained briefs to your specialists in parallel, and synthesizes their reports. Put a strong model on the Master and cheaper ones on the workers. It can propose new agents, but you must approve each one, even in Unrestricted mode. See [docs/MASTER_AGENT.md](docs/MASTER_AGENT.md).
+- **Steer while it works.** Send a message at any time: it is delivered before the agent's next step. Use `/btw` for a side question, `/model` and `/effort` to change model and reasoning depth from the chat.
 - **Choose a model for each agent.** Connect OpenAI-compatible APIs, local inference servers, Anthropic, or an eligible ChatGPT account. Discover models or enter a model ID yourself.
 - **Set their instructions.** Combine a workspace system prompt, individual agent instructions, and selected skills.
 - **Use all 29 Roblox skills offline.** The complete [roblox-brain](https://github.com/tabooharmony/roblox-brain) library ships with the app, including every `references/full.md`. Import additional local skill collections.
@@ -67,21 +69,39 @@ For a planning-only conversation, turn off the agent’s MCP connections in **Co
 
 ### Economy mode and token usage
 
-Version 0.1.1 uses economy context handling by default, including for existing agents:
+Economy context handling is on by default, including for existing agents:
 
 - The model receives a small `search_tools` / `call_tool` interface instead of every connected MCP tool definition on every request. Exact tool schemas are discovered only when needed.
-- All 29 skills remain installed. Skill instructions and references are loaded in pages of up to 5,000 characters, and duplicate pages already in context are not loaded again.
+- All 29 skills remain installed. Skill instructions and references are loaded in pages of up to 5,000 characters. **Pages an agent has read are remembered for the whole conversation** (up to 9,000 characters, oldest evicted first) and shared with the workers that have the skill, so they are neither fetched nor re-paid for on every message.
+- **Session memory replaces the old "forget on the next message" behavior.** The last three exchanges are sent verbatim. Older ones are folded locally into one line each (request, actions, result), together with a short list of recent actions and the current plan. No model call is used to summarize. `/compact` and `/clear` control this by hand.
+- **Prompt caching.** For Anthropic models the app marks tools, system blocks, and the newest message as cacheable, so every step of a run re-reads its prefix at the cached price. Instructions are kept byte-stable between steps. OpenAI caches stable prefixes on its own; other OpenAI-compatible servers vary.
 - Tool results are capped at 6,000 characters. Binary image/audio output is omitted from text context.
-- Serialized model context and tool definitions are limited to 36,000 characters per request. Old exchanges and complete old tool rounds are removed locally when needed, without a paid summarization request. The current user request is preserved; oversized instructions fail before inference.
-- The default budget is **30,000 total tokens per message**, across all its model requests. Change it under **Configure agent → Token budget per message**. Input estimates are checked before sending another request. An in-flight request can exceed the remaining estimate; this is not a billing guarantee.
-- Output is capped at 4,096 tokens per request, or a smaller remaining allowance. New agents default to eight model steps; existing agents retain their configured step limit.
+- Serialized model context and tool definitions are limited to 48,000 characters per request (the memory block is part of it). Old tool rounds are removed locally when needed. The current user request is preserved; oversized instructions fail before inference.
+- The default budget is **30,000 total tokens per message**, across all its model requests (a Master's budget covers its whole team). Change it under **Configure agent → Token budget per message**. Input estimates are checked before sending another request. An in-flight request can exceed the remaining estimate; this is not a billing guarantee.
+- Output is capped at 4,096 tokens per request by default, or a smaller remaining allowance. A higher `/effort` raises the cap (medium 8,192, high 12,000, xhigh/max 24,000) because reasoning uses output tokens; the token budget still applies. New agents default to twelve model steps; existing agents retain their configured step limit.
 - The conversation inspector separates **Conversation tokens**, **Last run tokens**, model request count, approximate context size, and cached input. Cached input is part of the reported input total, not an extra charge added by the app. Estimates are labeled when provider usage is unavailable.
 
 Opening the app or creating a conversation does not start model inference. Inference starts only when you send a message. The conversation total is cumulative and can include earlier runs; it is not startup usage or a price estimate. Actual plan consumption and billing depend on your provider. See [OpenAI’s prompt-caching documentation](https://developers.openai.com/api/docs/guides/prompt-caching) for the distinction between input, cached input, and cache writes.
 
+### Chat commands and messages while it works
+
+You do not have to wait for an agent to finish. A message sent while it works appears as **Queued** and is delivered as a `[User update]` before the agent's next model request (the request already in flight cannot be rewritten; use Stop to cut it short). Type `/` in the composer for suggestions.
+
+| Command | What it does |
+| --- | --- |
+| `/btw <question>` | Side question. Answered immediately from the conversation and memory, with no tools, without interrupting the running task and without entering the agent's context. |
+| `/model [name] [--save]` | Show or switch the model for this conversation. Accepts a partial name or `Provider:model`. `--save` also updates the agent. Applies from the next step, even mid-run. |
+| `/effort [low\|medium\|high\|xhigh\|max\|default]` | Reasoning depth. Sent to Claude 4.5+ / 5.x (adaptive thinking plus `output_config.effort`) and OpenAI reasoning models; ignored by models that do not take it. |
+| `/status` | Model, effort, tokens, budget, cache reads, memory, plan, queued messages. |
+| `/plan` | The Master's current plan. |
+| `/compact`, `/clear` | Fold history into memory, or forget earlier context (the transcript stays visible). |
+| `/stop`, `/help` | Stop the run; list commands. |
+
+The composer also has model and effort selectors. Text such as `/Workspace/Map is broken` is sent normally because only the commands above are recognized.
+
 ### Unrestricted access
 
-Open **Agents → Configure → Permissions → Unrestricted access**, then save. The agent runs its available MCP tools without application approval prompts, including writes. Switching to this mode also releases pending application approvals for that agent. Switching to Read only blocks subsequent mutations. Provider permissions, MCP server restrictions, Stop, step limits, and token budgets still apply.
+Open **Agents → Configure → Permissions → Unrestricted access**, then save. The agent runs its available MCP tools without application approval prompts, including writes. Switching to this mode also releases pending application approvals for that agent, except requests to create a new agent, which always wait for you. Switching to Read only blocks subsequent mutations. Provider permissions, MCP server restrictions, Stop, step limits, and token budgets still apply.
 
 | Connection | Authentication | Inference API |
 | --- | --- | --- |
@@ -216,13 +236,13 @@ resources/     Complete bundled Roblox skill library and attribution
 tests/         Unit tests and Electron desktop integration tests
 ```
 
-Independent agent conversations can run concurrently. Each uses a snapshot of its agent configuration at start; access-mode changes also apply to active runs. The runtime supports bounded model/tool loops, the selected access mode, cancellation, and explicit failures on incomplete provider streams. Studio calls to the same MCP server are queued to prevent interleaved actions.
+Independent agent conversations can run concurrently. Each uses a snapshot of its agent configuration at start; access-mode changes, `/model`, and `/effort` also apply to active runs. A Master's workers are extra threads inside its run (at most the concurrency limit at once) that share its token budget and abort with Stop. The runtime supports bounded model/tool loops, the selected access mode, cancellation, and explicit failures on incomplete provider streams. Studio calls to the same MCP server are queued to prevent interleaved actions.
 
 ## Current limitations
 
 - Live ChatGPT OAuth, live Anthropic inference, and real Studio place edits require the user’s account and Studio connection; fixture tests do not establish those external services’ availability.
 - This preview has text-based agent conversations. Image attachments and multimodal screenshot feedback are not implemented.
-- Agents are managed individually; automatic agent-to-agent delegation and shared task orchestration are not implemented.
+- The Master Agent delegates within one message: worker threads live for that message, and a worker cannot see the conversation or other workers. Workers do not run in the background after the Master answers, and there is no shared task board between conversations.
 - The project folder setting labels your workspace. Direct project filesystem tools, terminal access, and Rojo synchronization are not implemented; Studio access goes through MCP.
 - MCP OAuth discovery, automatic skill updates, configuration import, automatic application updates, signed releases, and native Claude Code integration are not implemented.
 - The app serializes its own Studio calls. It cannot coordinate external MCP clients or manual Studio edits made at the same time.

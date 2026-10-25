@@ -21,7 +21,7 @@ describe('economy context', () => {
     expect(JSON.stringify(result).length).toBeLessThan(36_000)
   })
   it('does not shorten the current task or silently drop oversized instructions', () => {
-    expect(() => compactTurns([{ role: 'system', content: 'x'.repeat(40_000) }, { role: 'user', content: 'Current task' }])).toThrow('Shorten')
+    expect(() => compactTurns([{ role: 'system', content: 'x'.repeat(60_000) }, { role: 'user', content: 'Current task' }])).toThrow('Shorten')
     expect(boundedText('x'.repeat(120_000)).length).toBeLessThanOrEqual(6000)
   })
   it('finds tools on demand and filters writes from read-only discovery', () => {
