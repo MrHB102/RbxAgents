@@ -6,7 +6,7 @@ The previous runtime resent every connected MCP tool definition on each model st
 
 This can make a multi-step task expensive even when its first user message is short. A high displayed conversation total does not prove that opening the agent made a paid request.
 
-0.1.1 introduced provider-independent tool discovery, paged skills, bounded tool results, output caps, and a configurable per-message token budget.
+0.1.1 introduced provider-independent tool discovery, paged skills, bounded tool results, output caps, and a configurable per-message token budget. The budget and the step limit were removed in 0.2.0 (see below).
 
 ## 0.2.0: stop paying twice, stop forgetting
 
@@ -19,10 +19,10 @@ What changed:
 - **Recent actions and plan.** The last eight tool actions of unfolded exchanges and the Master's plan are part of the memory block, so the agent knows what it already did without re-reading it.
 - **Prompt caching.** Anthropic requests mark tools, system blocks, and the newest message as cacheable. The system prompt is split into a stable block (workspace prompt, agent prompt, skill catalog, access mode) and a memory block that changes only when something new is learned. OpenAI caches stable prefixes on its own, and other OpenAI-compatible servers vary; the same layout helps wherever prefix caching exists.
 - **Context limit 48,000 characters** (was 36,000) because the memory block now lives inside it. The extra room is paid for by sending far less history.
-- **Effort-aware output caps.** Reasoning consumes output tokens, so `/effort medium|high|xhigh|max` raises the per-request cap to 8,192 / 12,000 / 24,000. The per-message token budget still applies.
+- **Effort-aware output caps.** Reasoning consumes output tokens, so `/effort medium|high|xhigh|max` raises the per-request cap to 8,192 / 12,000 / 24,000.
 - **Messages sent while an agent works** are delivered at the next step rather than starting a second run, and `/btw` answers from memory without adding to the agent's context.
-- **Web pages are paged like skills.** `web_fetch` returns up to 5,000 characters at a time (6,000 with metadata) and continues at `nextOffset`; a page is downloaded once per message however many pages of it are read, and links back to the same page are dropped from the text. A message is limited to 40 web requests.
-- **Claude Code connections** report usage from Claude Code's final result (input including cache reads and writes, plus output). The token budget is checked after each model request Claude Code makes and stops it when exceeded; a subscription is not billed per token, but the budget still bounds how fast a message uses it.
+- **Web pages are paged like skills.** `web_fetch` returns up to 5,000 characters at a time (6,000 with metadata) and continues at `nextOffset`; a page is downloaded once per message however many pages of it are read, and links back to the same page are dropped from the text.
+- **Claude Code connections** report usage from Claude Code's final result (input including cache reads and writes, plus output). Nothing stops it early except Stop; a subscription is not billed per token, but long runs use up its limits faster.
 - **Master Agent.** Reading and doing happens in worker threads on cheaper models; the Master sees only distilled reports. See [MASTER_AGENT.md](MASTER_AGENT.md).
 
 ## Regression coverage
@@ -33,7 +33,7 @@ What changed:
 - Read-only calls remain enforced through the gateway.
 - Unrestricted access executes mutations without application approvals and can release an existing pending approval, but never an agent-creation request.
 - Usage is counted per run and separately from conversation totals; a Master's run includes its workers.
-- Model requests stop when the remaining budget is insufficient; a worker out of budget returns its partial result instead of failing the run.
+- Runs are not limited by steps, tokens, or requests: a long tool loop (60 rounds at 50,000 tokens each in the test) finishes, and only Stop ends one early.
 - A skill page loaded in one message is not loaded again in the next.
 - Exchanges beyond the last three are folded into the digest and the recent ones stay verbatim.
 - Queued messages arrive before the next model request, including when they land during the final answer.

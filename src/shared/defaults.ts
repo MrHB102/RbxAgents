@@ -1,6 +1,6 @@
 import type { Agent, AppState } from './types'
 
-export const SCHEMA = 3
+export const SCHEMA = 4
 
 const WEB_RULES = `# Web
 web_search and web_fetch read the public internet. Use them for current Roblox documentation, API changes, DevForum answers, and library docs, not for what the project or Studio already shows you. Search, then read the best one or two results; do not crawl.
@@ -52,7 +52,7 @@ You have no Studio tools of your own. Workers have them. Never state that someth
 # How you work: plan big, execute small
 1. Plan. For anything beyond a simple question, call update_plan with 2 to 7 steps. Each step names the worker and the outcome that makes it done. Update statuses as work completes.
 2. Delegate. Use delegate with self-contained briefs: the goal, exact context (instance IDs, script paths, constraints, decisions the user made), and what to return. Workers cannot see this conversation or each other. Put independent steps in one delegate call so they run in parallel. Sequence steps that touch the same scripts or instances: never run two writers on one target at the same time.
-3. Read reports. Reports are distilled. Decide whether each satisfies its step. If not, use send_to_agent with a precise follow-up on the same thread instead of starting over. If a worker failed for an infrastructure reason (budget, rate limit, timeout), re-delegate the same brief once.
+3. Read reports. Reports are distilled. Decide whether each satisfies its step. If not, use send_to_agent with a precise follow-up on the same thread instead of starting over. If a worker failed for an infrastructure reason (rate limit, timeout), re-delegate the same brief once.
 4. Verify. Have a read-only worker review risky or large changes before you tell the user they are done.
 5. Answer. Give one synthesis: outcome, what changed, evidence, what remains. Do not paste worker reports.
 
@@ -101,7 +101,7 @@ export const LEGACY_AGENT_PROMPTS: Record<string, string> = {
 export function defaultAgents(): Agent[] {
   const workers: Agent[] = definitions.map(([name, agentRole, description, color, systemPrompt, skills]) => ({
     id: name.toLowerCase(), name, role: agentRole, description, color, systemPrompt, skillIds: ['roblox-collaboration-mode', ...skills],
-    providerId: '', model: '', mcpIds: ['roblox'], enabled: true, permission: name === 'Reviewer' ? 'read-only' : 'ask', maxSteps: 12, tokenBudget: 30_000
+    providerId: '', model: '', mcpIds: ['roblox'], enabled: true, permission: name === 'Reviewer' ? 'read-only' : 'ask'
   }))
   return [masterAgent(), ...workers]
 }
@@ -109,7 +109,7 @@ export function masterAgent(): Agent {
   return {
     id: 'master', name: 'Master', role: 'Orchestrator', description: 'Plans the work and delegates it to your specialist agents. Use a strong model here and cheaper models on the workers.',
     color: '#ff79c6', systemPrompt: MASTER_PROMPT, skillIds: ['roblox-collaboration-mode', 'roblox-architecture'], providerId: '', model: '', mcpIds: [],
-    enabled: true, permission: 'ask', maxSteps: 16, tokenBudget: 150_000, orchestrator: true
+    enabled: true, permission: 'ask', orchestrator: true
   }
 }
 export function initialState(hostId: string): AppState {
@@ -135,5 +135,7 @@ export function migrate(state: AppState) {
     }
     if (!state.agents.some(a => a.orchestrator || a.id === 'master')) state.agents.unshift(masterAgent())
   }
+  // Step limits and token budgets were removed in schema 4; saved values would only confuse an export.
+  for (const agent of state.agents) { delete (agent as { maxSteps?: number }).maxSteps; delete (agent as { tokenBudget?: number }).tokenBudget }
   state.schema = SCHEMA
 }

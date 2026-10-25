@@ -11,9 +11,8 @@ export interface TokenUsage { inputTokens: number; outputTokens: number; cachedI
 export interface TurnResult { text: string; calls: ToolCall[]; tokens: number; usage?: TokenUsage; thinking?: unknown[] }
 export interface TurnOptions {
   maxOutputTokens: number; effort?: Effort
-  /** Claude Code runs its own tool loop; it calls back here for each tool. Other providers ignore these three. */
+  /** Claude Code runs its own tool loop; it calls back here for each tool. Other providers ignore this. */
   execute?: (name: string, args: Record<string, unknown>) => Promise<string>
-  maxToolCalls?: number; tokenLimit?: number
 }
 
 const ANTHROPIC_EFFORT_MODEL = /^claude-(?:(?:fable|mythos|opus|sonnet|haiku)-5|opus-4-[5-8]|sonnet-4-6)/
@@ -107,7 +106,7 @@ export class Providers {
   }
   private async claudeCode(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void, options: TurnOptions): Promise<TurnResult> {
     if (!options.execute) throw new Error('Claude Code connections run through the agent runtime.')
-    const result = await this.claude.turn({ executable: provider.baseUrl, model, effort: options.effort, turns, tools, signal, onText: delta, execute: options.execute, maxToolCalls: options.maxToolCalls ?? 24, tokenLimit: options.tokenLimit ?? Infinity })
+    const result = await this.claude.turn({ executable: provider.baseUrl, model, effort: options.effort, turns, tools, signal, onText: delta, execute: options.execute })
     // Tool calls already ran inside Claude Code's loop, so there is nothing left for the runtime to execute.
     return { text: result.text, calls: [], tokens: result.tokens, usage: result.usage }
   }

@@ -7,7 +7,7 @@ import type { McpManager } from './mcp'
 import { readSkill } from './skills'
 import { instructions, roster } from './prompts'
 import { realWeb, webPage, type WebTools } from './web'
-import { BudgetError, boundedText, clip, compactTurns, findTools, foldAll, foldHistory, historyTurns, memoryBlock, memoryOf, outputCap, pinPage, skillPageParts, toolResultText, CONTEXT_CHARACTERS, DEFAULT_TOKEN_BUDGET } from './context'
+import { boundedText, clip, compactTurns, findTools, foldAll, foldHistory, historyTurns, memoryBlock, memoryOf, outputCap, pinPage, skillPageParts, toolResultText, CONTEXT_CHARACTERS } from './context'
 
 const PALETTE = ['#bd93f9', '#50fa7b', '#8be9fd', '#ffb86c', '#ff79c6', '#f1fa8c']
 const BTW_PROMPT = 'You answer a quick side question (/btw) asked while a task may be in progress. Use only the conversation excerpt and memory below. You have no tools and must not claim to have done or checked anything. If the question needs tool work or would change the task, say so in one line and suggest sending it as a normal message. Reply in the user\'s language, in at most 150 words.'
@@ -17,7 +17,7 @@ function error(value: unknown) { return value instanceof Error ? value.message :
 interface Participant {
   agent: Agent; primary: boolean; turns: Turn[]; tools: ToolSpec[]; skills: Skill[]; servers: McpServer[]
   memory: string; pinned: Set<string>; loaded: Map<string, string>
-  id?: string; usage?: ThreadUsage; cap: number; spent: number; busy: boolean
+  id?: string; usage?: ThreadUsage; spent: number; busy: boolean
   /** The provider runs its own tool loop (Claude Code), so tool rounds never appear in `turns`. */
   native?: boolean
 }
@@ -25,7 +25,7 @@ interface Run {
   session: Session; controller: AbortController; signal: AbortSignal; usage: RunUsage; primary: Agent
   threads: Map<string, Participant>; queue: string[]; counter: number
   slots: { free: number; waiting: (() => void)[] }
-  webCalls: number; webPages: Map<string, { url: string; title: string; text: string; truncated: boolean }>
+  webPages: Map<string, { url: string; title: string; text: string; truncated: boolean }>
 }
 
 /** Resolves `/model` arguments: `name`, or `Provider name:model`. Partial names match when unambiguous. */
@@ -86,9 +86,8 @@ export class AgentRuntime {
     if (!agent?.enabled) throw new Error('This agent is paused or no longer exists.')
     this.config(session, agent, true)
     const controller = new AbortController()
-    const budget = agent.tokenBudget ?? DEFAULT_TOKEN_BUDGET
-    const usage: RunUsage = { tokens: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, requests: 0, contextCharacters: 0, budget, estimated: false, threads: [] }
-    const run: Run = { session, controller, signal: controller.signal, usage, primary: agent, threads: new Map(), queue: [], counter: 0, slots: { free: Math.max(1, this.store.state.settings.maxConcurrent), waiting: [] }, webCalls: 0, webPages: new Map() }
+    const usage: RunUsage = { tokens: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, requests: 0, contextCharacters: 0, estimated: false, threads: [] }
+    const run: Run = { session, controller, signal: controller.signal, usage, primary: agent, threads: new Map(), queue: [], counter: 0, slots: { free: Math.max(1, this.store.state.settings.maxConcurrent), waiting: [] }, webPages: new Map() }
     this.runs.set(session.id, run)
     session.lastRun = usage
     session.status = 'running'
@@ -160,15 +159,16 @@ export class AgentRuntime {
     const memory = memoryBlock(run.session, primary ? {} : { skillIds: agent.skillIds, pinsOnly: true })
     const pinned = new Set(memoryOf(run.session).pins.filter(p => primary || agent.skillIds.includes(p.skillId)).map(p => p.key))
     const turns: Turn[] = [{ role: 'system', content: '' }, ...(memory ? [{ role: 'system' as const, content: memory }] : []), ...history]
-    return { agent, primary, turns, tools, skills, servers, memory, pinned, loaded: new Map(), cap: Infinity, spent: 0, busy: false }
+    return { agent, primary, turns, tools, skills, servers, memory, pinned, loaded: new Map(), spent: 0, busy: false }
   }
 
   /** The shared agent loop: model request, tool calls, repeat. Used by the primary agent and by every worker thread. */
-  private async converse(run: Run, p: Participant): Promise<{ text: string; status: 'done' | 'max_steps' }> {
+  private async converse(run: Run, p: Participant): Promise<{ text: string; status: 'done' }> {
     const { session, signal } = run
     const toolCharacters = JSON.stringify(p.tools).length
     let last = ''
-    for (let step = 0; step < p.agent.maxSteps; step++) {
+    // No step or token limit: the run ends when the model stops calling tools, or when the user presses Stop.
+    while (true) {
       signal.throwIfAborted()
       if (p.primary) this.deliverQueue(run, p)
       const cfg = this.config(run, p.agent, p.primary)
@@ -177,8 +177,6 @@ export class AgentRuntime {
       const context = JSON.stringify(p.turns).length + toolCharacters
       if (p.primary) run.usage.contextCharacters = context
       const estimatedInput = Math.ceil(context / 3)
-      const remaining = Math.min(run.usage.budget - run.usage.tokens, p.cap - p.spent)
-      if (estimatedInput + 128 > remaining) throw new BudgetError(p.primary ? 'Token budget reached for this message. Progress is saved. Send another message to continue, or change the agent’s token budget.' : 'This worker reached its token budget.')
       run.usage.requests++
       if (p.usage) p.usage.requests++
       p.native = cfg.provider.kind === 'claude-code'
@@ -202,7 +200,7 @@ export class AgentRuntime {
         open()
         message!.content += this.store.redact(chunk)
         if (Date.now() - lastEmit > 50) { this.store.emit(); lastEmit = Date.now() }
-      }, { maxOutputTokens: Math.min(outputCap(cfg.effort), remaining - estimatedInput), effort: cfg.effort, execute, maxToolCalls: p.agent.maxSteps * 3, tokenLimit: remaining })
+      }, { maxOutputTokens: outputCap(cfg.effort), effort: cfg.effort, execute })
       if (response.text) open()
       if (message) message.content = this.store.redact(response.text)
       close()
@@ -219,7 +217,6 @@ export class AgentRuntime {
         if (p.primary && run.queue.length) continue
         return { text: response.text || last, status: 'done' }
       }
-      if (response.calls.length > 32) throw new Error('The model requested too many tools in one step.')
       p.turns.push({ role: 'assistant', content: response.text, tool_calls: response.calls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })), ...(response.thinking ? { thinking: response.thinking } : {}) })
       const delegations = p.agent.orchestrator && response.calls.length > 1 && response.calls.every(c => c.name === 'delegate' || c.name === 'send_to_agent')
       const outputs = delegations ? await Promise.all(response.calls.map(c => this.runTool(run, p, c))) : undefined
@@ -232,8 +229,6 @@ export class AgentRuntime {
         this.store.save()
       }
     }
-    if (p.primary) throw new Error(`Stopped after ${p.agent.maxSteps} model steps. Review progress and send another message to continue.`)
-    return { text: last, status: 'max_steps' }
   }
 
   /** Messages typed while the agent works become user turns before the next model request. */
@@ -339,7 +334,6 @@ export class AgentRuntime {
   }
 
   private async webTool(run: Run, p: Participant, name: string, args: Record<string, any>) {
-    if (++run.webCalls > 40) throw new Error('This message has used its 40 web requests. Continue with what you have, or ask the user to send another message.')
     if (name === 'web_search') {
       if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('Give a search query.')
       const limit = Number.isSafeInteger(args.limit) ? args.limit : 5
@@ -413,7 +407,7 @@ export class AgentRuntime {
     let thread: Participant
     try { thread = await this.participant(run, agent, false, []) }
     catch (e) { if (run.signal.aborted) throw e; usage.status = 'error'; return { thread_id: id, agent: agent.name, status: 'error', error: this.store.redact(error(e)) } }
-    thread.id = id; thread.usage = usage; thread.cap = agent.tokenBudget ?? DEFAULT_TOKEN_BUDGET
+    thread.id = id; thread.usage = usage
     run.threads.set(id, thread)
     const context = typeof task.context === 'string' && task.context.trim() ? `\n\nContext from the Master:\n${task.context.slice(0, 4000)}` : ''
     return this.runThread(run, thread, `${task.brief}${context}`, reportLimit)
@@ -435,7 +429,7 @@ export class AgentRuntime {
       if (run.signal.aborted) throw e
       usage.status = 'error'
       const lastText = [...thread.turns].reverse().find(t => t.role === 'assistant' && t.content)?.content
-      return { thread_id: thread.id, agent: thread.agent.name, status: e instanceof BudgetError ? 'budget' : 'error', error: this.store.redact(error(e)), partial: lastText ? boundedText(lastText, 1500) : undefined, tokens: thread.spent - before }
+      return { thread_id: thread.id, agent: thread.agent.name, status: 'error', error: this.store.redact(error(e)), partial: lastText ? boundedText(lastText, 1500) : undefined, tokens: thread.spent - before }
     } finally { thread.busy = false; this.release(run); this.store.emit() }
   }
 
@@ -472,7 +466,7 @@ export class AgentRuntime {
     const approved = await this.approve({ id: randomUUID(), sessionId: session.id, agentId: p.agent.id, serverId: 'master', tool: 'create_agent', kind: 'create-agent', args: { name, role, description, system_prompt: systemPrompt, skills: skillIds, access: permission, model: `${provider?.name || 'provider'} · ${base.model}`, studio_tools: base.mcpIds.length > 0, reason } }, signal)
     if (!approved) throw new Error('The user declined to create this agent. Do not ask again; use an existing worker.')
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'agent'
-    const created: Agent = { id: `${slug}-${randomUUID().slice(0, 4)}`, name, role, description, color: PALETTE[this.store.state.agents.length % PALETTE.length], providerId: base.providerId, model: base.model, systemPrompt, skillIds, mcpIds: [...base.mcpIds], enabled: true, permission, maxSteps: 12, tokenBudget: base.tokenBudget ?? DEFAULT_TOKEN_BUDGET, effort: base.effort }
+    const created: Agent = { id: `${slug}-${randomUUID().slice(0, 4)}`, name, role, description, color: PALETTE[this.store.state.agents.length % PALETTE.length], providerId: base.providerId, model: base.model, systemPrompt, skillIds, mcpIds: [...base.mcpIds], enabled: true, permission, effort: base.effort }
     this.store.state.agents.push(created)
     this.store.log('success', `Agent created: ${name}`, `Proposed by ${p.agent.name}. ${reason}`, created.id)
     session.status = 'running'; this.store.save()
@@ -585,7 +579,7 @@ export class AgentRuntime {
     return [
       `Agent: ${agent?.name || 'none'}${agent?.orchestrator ? ' (orchestrator)' : ''} · ${cfg ? `${cfg.model} (${cfg.provider.name})` : 'no model configured'}`,
       `Effort: ${session.overrides?.effort || agent?.effort || 'provider default'}`,
-      `Tokens: ${session.tokens.toLocaleString('en-US')} in this conversation${run ? ` · last run ${run.tokens.toLocaleString('en-US')} of ${run.budget.toLocaleString('en-US')} budget, ${run.requests} requests, ${run.cachedInputTokens.toLocaleString('en-US')} cached` : ''}`,
+      `Tokens: ${session.tokens.toLocaleString('en-US')} in this conversation${run ? ` · last run ${run.tokens.toLocaleString('en-US')}, ${run.requests} requests, ${run.cachedInputTokens.toLocaleString('en-US')} cached` : ''}`,
       `Memory: ${memory.digest.length} folded exchanges · ${memory.pins.length} skill pages kept (${memory.pins.reduce((n, p) => n + p.text.length, 0).toLocaleString('en-US')} chars)`,
       session.plan?.length ? `Plan: ${done}/${session.plan.length} done` : 'Plan: none',
       this.runs.has(session.id) ? `Running · ${this.runs.get(session.id)!.queue.length} message(s) queued` : 'Idle'

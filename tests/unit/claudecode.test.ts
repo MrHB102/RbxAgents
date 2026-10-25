@@ -4,7 +4,6 @@ import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { ClaudeCode, renderPrompt, locateClaude } from '../../src/main/claudecode'
-import { BudgetError } from '../../src/main/context'
 import type { ToolSpec } from '../../src/main/providers'
 
 const sdk = pathToFileURL(resolve('node_modules/@modelcontextprotocol/sdk/dist/esm/')).href + '/'
@@ -60,7 +59,7 @@ process.exit(0)
 }
 const tools: ToolSpec[] = [{ name: 'search_tools', description: 'Find tools', parameters: { type: 'object', properties: { query: { type: 'string' } } } }, { name: 'call_tool', description: 'Run a tool', parameters: { type: 'object' } }]
 const plan = (...calls: { name: string; args: object }[]) => [{ role: 'system' as const, content: 'SYSTEM RULES' }, { role: 'user' as const, content: `PLAN ${JSON.stringify(calls)}\nDo it.` }]
-const base = { executable: '', model: 'haiku', tools, signal: new AbortController().signal, onText: () => {}, maxToolCalls: 10, tokenLimit: 1_000_000 }
+const base = { executable: '', model: 'haiku', tools, signal: new AbortController().signal, onText: () => {} }
 
 describe('Claude Code provider', () => {
   it('runs Claude Code without its own tools and serves ours through an authenticated local bridge', async () => {
@@ -92,18 +91,18 @@ describe('Claude Code provider', () => {
     expect(recorded().results[0]).toMatchObject({ isError: true, content: [{ text: 'Denied by the user.' }] })
   })
 
-  it('refuses tool calls beyond the limit', async () => {
+  it('does not limit how many tools Claude Code may call', async () => {
     const { claude, recorded } = fakeClaude()
     let executed = 0
-    await claude.turn({ ...base, maxToolCalls: 1, turns: plan({ name: 'call_tool', args: {} }, { name: 'call_tool', args: {} }), execute: async () => { executed++; return 'ok' } })
-    expect(executed).toBe(1)
-    expect(recorded().results[1]).toMatchObject({ isError: true })
-    expect(recorded().results[1].content[0].text).toContain('limit')
+    await claude.turn({ ...base, turns: plan(...Array.from({ length: 40 }, () => ({ name: 'call_tool', args: {} }))), execute: async () => { executed++; return 'ok' } })
+    expect(executed).toBe(40)
+    expect(recorded().results.every((r: { isError?: boolean }) => !r.isError)).toBe(true)
   })
 
-  it('stops the process and raises a budget error when the token limit is exceeded', async () => {
+  it('does not stop a turn for using many tokens', async () => {
     const { claude } = fakeClaude()
-    await expect(claude.turn({ ...base, tokenLimit: 50, turns: plan({ name: 'call_tool', args: {} }), execute: async () => 'ok' })).rejects.toBeInstanceOf(BudgetError)
+    const result = await claude.turn({ ...base, turns: plan(...Array.from({ length: 20 }, () => ({ name: 'call_tool', args: {} }))), execute: async () => 'ok' })
+    expect(result.text).toBe('Done.')
   })
 
   it('kills Claude Code when the run is stopped', async () => {

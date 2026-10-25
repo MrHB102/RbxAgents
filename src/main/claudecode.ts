@@ -9,7 +9,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import type { Effort } from '../shared/types'
 import type { ToolSpec, Turn } from './providers'
-import { BudgetError, boundedText } from './context'
+import { boundedText } from './context'
 
 /**
  * Claude Code as a model provider.
@@ -28,10 +28,6 @@ export interface ClaudeTurnInput {
   onText: (text: string) => void
   /** Runs one tool call requested by Claude Code and returns its result text. May throw to report an error. */
   execute: (name: string, args: Record<string, unknown>) => Promise<string>
-  /** Tool calls allowed in this turn. Further calls are refused and the process is stopped shortly after. */
-  maxToolCalls: number
-  /** Total tokens this turn may use. Checked after every model request Claude Code makes. */
-  tokenLimit: number
 }
 export interface ClaudeTurnResult { text: string; tokens: number; usage: { inputTokens: number; outputTokens: number; cachedInputTokens: number } }
 
@@ -116,11 +112,8 @@ export class ClaudeCode {
     const launcher = this.resolve(input.executable)
     const directory = mkdtempSync(join(tmpdir(), 'rbx-claude-'))
     const token = randomBytes(24).toString('hex')
-    let toolCalls = 0
-    let failure: Error | undefined
     let child: ChildProcess | undefined
     let bridge: HttpServer | undefined
-    const stop = (error: Error) => { failure ??= error; if (child) killTree(child) }
     try {
       bridge = createServer(async (req, res) => {
         // Only the Claude Code process started for this turn knows the token.
@@ -130,10 +123,6 @@ export class ClaudeCode {
         const server = new Server({ name: 'rbx', version: '1.0.0' }, { capabilities: { tools: {} } })
         server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: input.tools.map(t => ({ name: t.name, description: t.description, inputSchema: t.parameters as { type: 'object' } })) }))
         server.setRequestHandler(CallToolRequestSchema, async request => {
-          if (++toolCalls > input.maxToolCalls) {
-            if (toolCalls > input.maxToolCalls + 3) stop(new Error(`Stopped after ${input.maxToolCalls} tool calls. Review progress and send another message to continue.`))
-            return { isError: true, content: [{ type: 'text' as const, text: 'Tool call limit reached for this message. Stop calling tools and summarize what is done and what remains.' }] }
-          }
           try {
             const args = request.params.arguments && typeof request.params.arguments === 'object' ? request.params.arguments : {}
             return { content: [{ type: 'text' as const, text: await input.execute(request.params.name, args) }] }
@@ -161,18 +150,14 @@ export class ClaudeCode {
       child.stdin!.end(renderPrompt(input.turns))
       let stderr = ''
       child.stderr!.on('data', chunk => { stderr = (stderr + chunk).slice(-4000) })
-      let text = '', tokens = 0
+      let text = ''
       let final: { is_error?: boolean; result?: string; usage?: Record<string, number>; subtype?: string } | undefined
       let buffer = ''
       const handle = (line: string) => {
         let event: any
         try { event = JSON.parse(line) } catch { return }
         if (event.type === 'stream_event' && event.event?.type === 'content_block_delta' && event.event.delta?.type === 'text_delta') input.onText(event.event.delta.text)
-        else if (event.type === 'assistant') {
-          const usage = event.message?.usage || {}
-          tokens += (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.output_tokens || 0)
-          if (tokens > input.tokenLimit) stop(new BudgetError('Token budget reached for this message. Progress is saved. Send another message to continue, or change the agent’s token budget.'))
-        } else if (event.type === 'result') {
+        else if (event.type === 'result') {
           final = event; text = typeof event.result === 'string' ? event.result : text
           // The answer is complete; do not wait on a process that lingers.
           setTimeout(() => child && killTree(child), 5000).unref()
@@ -187,7 +172,6 @@ export class ClaudeCode {
       signal.removeEventListener('abort', abort)
       if (buffer.trim()) handle(buffer)
       signal.throwIfAborted()
-      if (failure) throw failure
       if (!final) throw new Error(`Claude Code stopped without an answer${code ? ` (exit ${code})` : ''}. ${boundedText(stderr.trim(), 400)}`.trim())
       if (final.is_error) {
         const message = String(final.result || final.subtype || 'Claude Code reported an error.')

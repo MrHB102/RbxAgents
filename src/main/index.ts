@@ -19,7 +19,7 @@ const id = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/)
 const short = z.string().trim().min(1).max(200)
 const agentSchema = z.object({
   id, name: short, role: short, description: z.string().max(2000), color: z.string().regex(/^#[a-fA-F0-9]{6}$/),
-  providerId: z.string().max(100), model: z.string().max(200), systemPrompt: z.string().max(100_000), skillIds: z.array(id).max(300), mcpIds: z.array(id).max(30), enabled: z.boolean(), permission: z.enum(['ask', 'read-only', 'unrestricted']), maxSteps: z.number().int().min(1).max(100), tokenBudget: z.number().int().min(1000).max(1_000_000).default(30_000),
+  providerId: z.string().max(100), model: z.string().max(200), systemPrompt: z.string().max(100_000), skillIds: z.array(id).max(300), mcpIds: z.array(id).max(30), enabled: z.boolean(), permission: z.enum(['ask', 'read-only', 'unrestricted']),
   effort: z.enum(EFFORTS).optional(), orchestrator: z.boolean().optional(), web: z.boolean().optional()
 })
 const providerSchema = z.object({ id, name: short, kind: z.enum(['openai', 'anthropic', 'chatgpt', 'claude-code']), baseUrl: z.string().max(2000), apiKey: z.string().max(20_000).optional(), models: z.array(z.string().max(200)).max(1000).default([]) })

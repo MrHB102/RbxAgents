@@ -118,15 +118,17 @@ describe('agent tool permissions', () => {
       expect(store.state.sessions[0].lastRun?.contextCharacters).toBeLessThanOrEqual(36_000)
     } finally { cleanup() }
   })
-  it('stops before another model request when the run budget is consumed', async () => {
+  it('keeps going past many steps and any amount of tokens; only Stop ends a long run', async () => {
     const { store, runtime, turn, cleanup } = fixture(false, true)
-    store.state.agents.find(a => a.id === 'architect')!.tokenBudget = 10_000
-    turn.mockImplementation(async () => ({ text: '', tokens: 10_000, calls: [{ id: 'call', name: 'search_tools', arguments: '{"query":"execute_luau"}' }] }))
+    let rounds = 0
+    turn.mockImplementation(async () => rounds++ < 60 ? { text: '', tokens: 50_000, calls: [{ id: `call-${rounds}`, name: 'search_tools', arguments: '{"query":"execute_luau"}' }] } : { text: 'Finished.', tokens: 50_000, calls: [] })
     try {
       await runtime.send('session', 'Make the change.')
-      await vi.waitFor(() => expect(runtime.isRunning('session')).toBe(false))
-      expect(turn).toHaveBeenCalledOnce()
-      expect(store.state.sessions[0].messages.at(-1)?.content).toContain('Token budget reached')
+      await vi.waitFor(() => expect(runtime.isRunning('session')).toBe(false), { timeout: 10_000 })
+      expect(turn).toHaveBeenCalledTimes(61)
+      expect(store.state.sessions[0].status).toBe('idle')
+      expect(store.state.sessions[0].messages.at(-1)?.content).toBe('Finished.')
+      expect(store.state.sessions[0].lastRun?.tokens).toBe(61 * 50_000)
     } finally { cleanup() }
   })
 })

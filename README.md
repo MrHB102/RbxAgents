@@ -27,7 +27,7 @@ Built with a clean Dracula-inspired interface, a complete Roblox skill library, 
 - **Use all 29 Roblox skills offline.** The complete [roblox-brain](https://github.com/tabooharmony/roblox-brain) library ships with the app, including every `references/full.md`. Import additional local skill collections.
 - **Connect directly to Studio.** The [Chrrxs Roblox Studio MCP](https://github.com/Chrrxs/robloxstudio-mcp) server and matching plugin are bundled. Install the plugin from inside the app without a separate Node.js installation.
 - **Choose an access mode.** Use Ask before changes, Read only, or **Unrestricted access** to execute tools without approval prompts. Calls to the same MCP server are serialized across agents.
-- **Spend fewer tokens.** Discover MCP tools on demand, load paged skill references, keep bounded context, and set a token budget for each message.
+- **Spend fewer tokens.** Discover MCP tools on demand, load paged skill references, keep bounded context, and remember what was learned between messages.
 - **Keep your context.** Conversations, agent settings, token counts reported by providers, and recent activity are stored locally. Export agent definitions and the workspace prompt without credentials.
 
 RBX Agents is a functional desktop preview. See [Current limitations](#current-limitations) for the verification and platform boundaries.
@@ -78,8 +78,8 @@ Economy context handling is on by default, including for existing agents:
 - **Prompt caching.** For Anthropic models the app marks tools, system blocks, and the newest message as cacheable, so every step of a run re-reads its prefix at the cached price. Instructions are kept byte-stable between steps. OpenAI caches stable prefixes on its own; other OpenAI-compatible servers vary.
 - Tool results are capped at 6,000 characters. Binary image/audio output is omitted from text context.
 - Serialized model context and tool definitions are limited to 48,000 characters per request (the memory block is part of it). Old tool rounds are removed locally when needed. The current user request is preserved; oversized instructions fail before inference.
-- The default budget is **30,000 total tokens per message**, across all its model requests (a Master's budget covers its whole team). Change it under **Configure agent → Token budget per message**. Input estimates are checked before sending another request. An in-flight request can exceed the remaining estimate; this is not a billing guarantee.
-- Output is capped at 4,096 tokens per request by default, or a smaller remaining allowance. A higher `/effort` raises the cap (medium 8,192, high 12,000, xhigh/max 24,000) because reasoning uses output tokens; the token budget still applies. New agents default to twelve model steps; existing agents retain their configured step limit.
+- **There are no per-message limits.** An agent works until it stops calling tools or you press **Stop**: no step limit, token budget, or request cap, for agents, a Master's workers, web access, or Claude Code. Stop ends everything, including workers and pending approvals. Watch the inspector's token counts while a long task runs, because a model that keeps calling tools will keep spending your provider's tokens.
+- Each response is capped at 4,096 output tokens by default, because provider APIs require a cap. A higher `/effort` raises it (medium 8,192, high 12,000, xhigh/max 24,000) because reasoning uses output tokens.
 - The conversation inspector separates **Conversation tokens**, **Last run tokens**, model request count, approximate context size, and cached input. Cached input is part of the reported input total, not an extra charge added by the app. Estimates are labeled when provider usage is unavailable.
 
 Opening the app or creating a conversation does not start model inference. Inference starts only when you send a message. The conversation total is cumulative and can include earlier runs; it is not startup usage or a price estimate. Actual plan consumption and billing depend on your provider. See [OpenAI’s prompt-caching documentation](https://developers.openai.com/api/docs/guides/prompt-caching) for the distinction between input, cached input, and cache writes.
@@ -93,7 +93,7 @@ You do not have to wait for an agent to finish. A message sent while it works ap
 | `/btw <question>` | Side question. Answered immediately from the conversation and memory, with no tools, without interrupting the running task and without entering the agent's context. |
 | `/model [name] [--save]` | Show or switch the model for this conversation. Accepts a partial name or `Provider:model`. `--save` also updates the agent. Applies from the next step, even mid-run. |
 | `/effort [low\|medium\|high\|xhigh\|max\|default]` | Reasoning depth. Sent to Claude 4.5+ / 5.x (adaptive thinking plus `output_config.effort`) and OpenAI reasoning models; ignored by models that do not take it. |
-| `/status` | Model, effort, tokens, budget, cache reads, memory, plan, queued messages. |
+| `/status` | Model, effort, tokens, cache reads, memory, plan, queued messages. |
 | `/plan` | The Master's current plan. |
 | `/compact`, `/clear` | Fold history into memory, or forget earlier context (the transcript stays visible). |
 | `/stop`, `/help` | Stop the run; list commands. |
@@ -112,13 +112,13 @@ Because a model chooses the addresses and page text can try to steer it, the app
 - Only the public internet: loopback, private, link-local, and cloud-metadata addresses are refused, including when a public name resolves to one and after every redirect. Only ports 80 and 443; no usernames in URLs.
 - GET only, with no cookies or credentials. Text pages and data files only (no images, PDFs, or downloads), at most 2 MB, 15 seconds, and 5 redirects.
 - Results carry `untrusted_web_content: true`, and the prompts tell agents to ignore instructions found in pages and never to put project code or secrets in a query or URL.
-- At most 40 web requests per message. Tool calls are listed in the chat and under **Activity**.
+- Every web call is listed in the chat and under **Activity**.
 
 Web access does not need approval in any access mode, because it changes nothing in Studio. Search queries go to the search engine, page requests go to the websites, and page text becomes part of what is sent to your model provider.
 
 ### Unrestricted access
 
-Open **Agents → Configure → Permissions → Unrestricted access**, then save. The agent runs its available MCP tools without application approval prompts, including writes. Switching to this mode also releases pending application approvals for that agent, except requests to create a new agent, which always wait for you. Switching to Read only blocks subsequent mutations. Provider permissions, MCP server restrictions, Stop, step limits, and token budgets still apply.
+Open **Agents → Configure → Permissions → Unrestricted access**, then save. The agent runs its available MCP tools without application approval prompts, including writes. Switching to this mode also releases pending application approvals for that agent, except requests to create a new agent, which always wait for you. Switching to Read only blocks subsequent mutations. Provider permissions, MCP server restrictions, and Stop still apply.
 
 | Connection | Authentication | Inference API |
 | --- | --- | --- |
@@ -154,7 +154,7 @@ How the Claude Code connection works:
 - RBX Agents starts your own, unmodified `claude` program for each model turn (`claude -p`, streaming JSON). It was tested with Claude Code 2.1.310 and is found on your PATH or at the path you choose. A `.cmd` wrapper is not supported; use the native `claude.exe`.
 - **The app never reads, copies, or stores Claude credentials or tokens.** Sign-in belongs to Claude Code. Only the account kind and Claude Code's version are shown in the app. Signing out of the app connection does not sign Claude Code out.
 - Claude Code's built-in tools are switched off (`--tools ""`), user settings, slash commands, and other MCP servers are not loaded, and it runs in an empty temporary folder, so no project settings or memory files are found. Its only tools are the ones this app offers (`search_tools`, `call_tool`, `load_skill`, `web_search`, `web_fetch`, and the Master's delegation tools) through a loopback MCP server that exists for one turn and requires a random bearer token. Every call goes through the agent's access mode, approvals, step limit, and token budget.
-- Messages you send while it works are delivered inside its next tool result, so steering works here too. Step limits count tool calls (three per step). `/model` accepts `fable`, `opus`, `sonnet`, `haiku`, or a full model ID, and `/effort` maps to Claude Code's `--effort`.
+- Messages you send while it works are delivered inside its next tool result, so steering works here too. `/model` accepts `fable`, `opus`, `sonnet`, `haiku`, or a full model ID, and `/effort` maps to Claude Code's `--effort`.
 - It starts a process per turn, so each turn has a short startup cost.
 
 **Anthropic's terms matter here.** Their [authentication and credential-use guidance](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) says OAuth sign-in is for Claude Code and Anthropic's own apps, that developers building products should use API keys, and that third-party apps may not offer Claude.ai login or route requests through Free, Pro, or Max plan credentials on behalf of users. The same page allows a person to sign in to the unmodified Claude Code binary with their own subscription. This connection keeps credentials entirely inside Claude Code, but whether driving it from another application is within Anthropic's terms is Anthropic's call, not this project's, and they state they may enforce their rules without notice. If that risk is not acceptable for you, use an API key.
@@ -267,7 +267,7 @@ resources/     Complete bundled Roblox skill library and attribution
 tests/         Unit tests and Electron desktop integration tests
 ```
 
-Independent agent conversations can run concurrently. Each uses a snapshot of its agent configuration at start; access-mode changes, `/model`, and `/effort` also apply to active runs. A Master's workers are extra threads inside its run (at most the concurrency limit at once) that share its token budget and abort with Stop. The runtime supports bounded model/tool loops, the selected access mode, cancellation, and explicit failures on incomplete provider streams. Studio calls to the same MCP server are queued to prevent interleaved actions.
+Independent agent conversations can run concurrently. Each uses a snapshot of its agent configuration at start; access-mode changes, `/model`, and `/effort` also apply to active runs. A Master's workers are extra threads inside its run (at most the concurrency limit at once) that abort with Stop. The runtime supports model/tool loops, the selected access mode, cancellation, and explicit failures on incomplete provider streams. Studio calls to the same MCP server are queued to prevent interleaved actions.
 
 ## Current limitations
 

@@ -233,14 +233,16 @@ describe('Master Agent', () => {
     } finally { cleanup() }
   })
 
-  it('returns a worker that is out of budget as a result instead of failing the run', async () => {
-    const { store, runtime, cleanup } = fixture(({ who, index }) => who === 'worker' ? { text: 'x'.repeat(10) } : index === 0 ? delegate({ agent_id: 'scripter', brief: 'A' }) : { text: 'Handled.' }, s => { s.state.agents.find(a => a.id === 'scripter')!.tokenBudget = 1000 })
+  it('lets a worker work as long as it needs: no step or token limit', async () => {
+    const { store, runtime, calls, cleanup } = fixture(({ who, index, turns }) => who === 'worker'
+      ? (turns.filter(t => t.role === 'tool').length < 30 ? { calls: [{ name: 'call_tool', arguments: { server_id: 'roblox', name: 'get_script_source', arguments: {} } }] } : { text: 'Read 30 scripts.' })
+      : index === 0 ? delegate({ agent_id: 'scripter', brief: 'A' }) : { text: `Master saw: ${turns.filter(t => t.role === 'tool').at(-1)?.content.includes('Read 30 scripts')}` })
     try {
       await runtime.send('master', 'Go.')
       await idle(runtime, 'master')
-      const session = store.state.sessions.find(s => s.id === 'master')!
-      expect(session.status).toBe('idle')
-      expect(session.messages.at(-1)?.content).toBe('Handled.')
+      expect(calls.filter(c => c.who === 'worker')).toHaveLength(31)
+      expect(store.state.sessions.find(s => s.id === 'master')!.messages.at(-1)?.content).toBe('Master saw: true')
+      expect(store.state.sessions.find(s => s.id === 'master')!.status).toBe('idle')
     } finally { cleanup() }
   })
 
@@ -327,7 +329,9 @@ describe('Claude Code connection', () => {
       expect(seen.outputs[1]).toContain('[User update, sent while you were working]\nAlso rename it.')
       expect(seen.outputs[2]).toContain('alreadyLoaded')
       expect(session.messages.some(m => m.kind === 'queued')).toBe(false)
-      expect(seen.options).toMatchObject({ maxToolCalls: 36, tokenLimit: expect.any(Number) })
+      expect(seen.options.execute).toBeTypeOf('function')
+      expect(seen.options).not.toHaveProperty('maxToolCalls')
+      expect(seen.options).not.toHaveProperty('tokenLimit')
       expect(session.lastRun?.tokens).toBe(5)
     } finally { f.cleanup(); runtime.close() }
   })
@@ -379,15 +383,15 @@ describe('web access', () => {
     } finally { f.cleanup() }
   })
 
-  it('reports web errors to the model and stops after 40 requests in one message', async () => {
+  it('reports web errors to the model and does not cap how many requests a message makes', async () => {
     const web: WebTools = { search: async () => ({ backend: 'duckduckgo', results: [] }), fetch: async () => { throw new Error('The site answered 404 (not found).') } }
-    const f = fixture(({ index }) => index < 41 ? { calls: [{ name: 'web_fetch', arguments: { url: `https://example.com/${index}` } }] } : { text: 'Stopping.' }, store => { store.state.agents.find(a => a.id === 'architect')!.maxSteps = 60 }, web)
+    const f = fixture(({ index }) => index < 60 ? { calls: [{ name: 'web_fetch', arguments: { url: `https://example.com/${index}` } }] } : { text: 'Done.' }, undefined, web)
     try {
       await f.runtime.send('architect', 'Crawl.'); await idle(f.runtime, 'architect')
       const outputs = toolOutputs(f.store, 'architect')
       expect(outputs[0]).toContain('404')
-      expect(outputs.at(-1)).toContain('40 web requests')
-      expect(outputs.filter(o => o.includes('404'))).toHaveLength(40)
+      expect(outputs.filter(o => o.includes('404'))).toHaveLength(60)
+      expect(f.store.state.sessions.find(s => s.id === 'architect')!.messages.at(-1)?.content).toBe('Done.')
     } finally { f.cleanup() }
   })
 })

@@ -14,7 +14,7 @@ The cookbook runs on Anthropic's hosted Managed Agents. RBX Agents runs the same
 | Worker ends with `send_to_parent` | A worker's final message is its report, capped and returned as the `delegate` result. Raw pages and logs never reach the Master. |
 | "The orchestrator can't see its workers' system prompts" | The Master's instructions include a live roster built from the real agent definitions (id, specialty, description, model, access, skills). It cannot drift from the workers. |
 | Inline agents disabled, so the split holds | The Master can only delegate to listed agents. A new one needs `create_agent`, which you must approve. |
-| Session `budget` caps the whole team | The Master's **Team token budget per message** covers the Master and every worker. Each worker also stays within its own budget. A worker that runs out returns `status: "budget"` with its partial result, and the Master decides what to do. |
+| Session `budget` caps the whole team | Not used. There is no token budget or step limit; the cookbook's cap guards against unbounded fan-out, which here is bounded by at most four tasks per `delegate` call and your concurrency setting, and **Stop** ends the Master and every worker. A worker that fails returns `status: "error"` with its partial result, and the Master decides what to do. |
 | Per-thread `usage` | The conversation inspector lists tokens and status per worker for the last run. |
 | Re-assign on infrastructure errors | The Master prompt tells it to re-delegate a failed brief once. |
 

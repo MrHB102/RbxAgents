@@ -17,9 +17,9 @@ try {
   assert.equal(snapshot.appVersion, JSON.parse(readFileSync('package.json', 'utf8')).version)
   assert.equal(snapshot.skills.filter(skill => skill.builtin).length, 29)
   assert.equal(snapshot.agents.length, 5)
-  const agent = await page.evaluate(config => window.rbx.invoke('agent:save', config), { ...snapshot.agents[0], permission: 'unrestricted', tokenBudget: 30_000 })
+  const agent = await page.evaluate(config => window.rbx.invoke('agent:save', config), { ...snapshot.agents[0], permission: 'unrestricted' })
   assert.equal(agent.permission, 'unrestricted')
-  assert.equal(agent.tokenBudget, 30_000)
+  assert.equal('tokenBudget' in agent, false)
   const bundled = snapshot.servers.find(server => server.id === 'roblox')
   const pluginDirectory = join(profile, 'temporary-studio-plugins')
   await page.evaluate(config => window.rbx.invoke('mcp:save', config), {
@@ -30,5 +30,5 @@ try {
   const plugins = readdirSync(pluginDirectory).filter(name => name.endsWith('.rbxmx'))
   assert.equal(plugins.length, 1)
   assert.ok(statSync(join(pluginDirectory, plugins[0])).size > 1_000_000)
-  console.log('Packaged application verified: isolated profile, renderer, 29 skills, Unrestricted access, economy budget, and bundled plugin installer.')
+  console.log('Packaged application verified: isolated profile, renderer, 29 skills, Unrestricted access, no per-message limits, and bundled plugin installer.')
 } finally { await desktop.close() }

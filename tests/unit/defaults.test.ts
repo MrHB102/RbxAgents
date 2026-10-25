@@ -41,6 +41,13 @@ describe('workspace upgrade', () => {
     migrate(edited)
     expect(edited.settings.globalPrompt).toBe(`${GLOBAL_PROMPT_V2}\nMy rule.`)
   })
+  it('drops the removed step limits and token budgets from saved agents', () => {
+    const state = initialState('host'); state.schema = 3
+    for (const agent of state.agents) Object.assign(agent, { maxSteps: 8, tokenBudget: 30_000 })
+    migrate(state)
+    expect(state.agents.every(a => !('maxSteps' in a) && !('tokenBudget' in a))).toBe(true)
+    expect(state.agents.length).toBe(initialState('host').agents.length)
+  })
   it('does not overwrite a customized workspace prompt', () => {
     const state = initialState('host'); state.schema = 1; state.settings.globalPrompt = 'Custom rules'
     migrate(state)

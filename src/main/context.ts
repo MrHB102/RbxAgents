@@ -3,7 +3,6 @@ import type { Effort, McpServer, McpTool, Message, PinnedPage, PlanStep, Session
 
 export const CONTEXT_CHARACTERS = 48_000
 export const TOOL_RESULT_CHARACTERS = 6_000
-export const DEFAULT_TOKEN_BUDGET = 30_000
 export const MAX_OUTPUT_TOKENS = 4096
 /** Skill pages kept across messages, newest last. Older pages are evicted first. */
 export const PIN_CHARACTERS = 9_000
@@ -11,9 +10,6 @@ export const DIGEST_LINES = 14
 export const DIGEST_CHARACTERS = 3_500
 export const KEEP_EXCHANGES = 3
 const HISTORY_ANSWER_CHARACTERS = 3_000
-
-/** The run, or one worker, has used its token allowance. */
-export class BudgetError extends Error {}
 
 export function clip(text: string, limit: number) {
   const flat = text.replace(/\s+/g, ' ').trim()
@@ -25,7 +21,7 @@ export function boundedText(text: string, limit = TOOL_RESULT_CHARACTERS) {
   return text.slice(0, Math.max(0, limit - suffix.length)) + suffix
 }
 
-/** Reasoning consumes output tokens, so deeper effort needs a larger response cap. The token budget still applies. */
+/** Reasoning consumes output tokens, so deeper effort needs a larger response cap. */
 export function outputCap(effort?: Effort) {
   return effort === 'max' || effort === 'xhigh' ? 24_000 : effort === 'high' ? 12_000 : effort === 'medium' ? 8192 : MAX_OUTPUT_TOKENS
 }
