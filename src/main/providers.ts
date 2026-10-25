@@ -2,13 +2,19 @@ import type { Effort, Provider } from '../shared/types'
 import type { Store } from './store'
 import type { ChatGPTAuth } from './auth'
 import { checkedFetch, sseEvents, validateEndpoint } from './http'
+import { CLAUDE_CODE_MODELS, ClaudeCode } from './claudecode'
 
 export interface ToolSpec { name: string; description: string; parameters: Record<string, unknown> }
 export interface ToolCall { id: string; name: string; arguments: string }
 export interface Turn { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]; tool_call_id?: string; /** Anthropic thinking blocks that must be replayed unchanged next to their tool calls. */ thinking?: unknown[] }
 export interface TokenUsage { inputTokens: number; outputTokens: number; cachedInputTokens: number }
 export interface TurnResult { text: string; calls: ToolCall[]; tokens: number; usage?: TokenUsage; thinking?: unknown[] }
-export interface TurnOptions { maxOutputTokens: number; effort?: Effort }
+export interface TurnOptions {
+  maxOutputTokens: number; effort?: Effort
+  /** Claude Code runs its own tool loop; it calls back here for each tool. Other providers ignore these three. */
+  execute?: (name: string, args: Record<string, unknown>) => Promise<string>
+  maxToolCalls?: number; tokenLimit?: number
+}
 
 const ANTHROPIC_EFFORT_MODEL = /^claude-(?:(?:fable|mythos|opus|sonnet|haiku)-5|opus-4-[5-8]|sonnet-4-6)/
 /** Request fields that set reasoning depth. Empty when the provider/model does not take the parameter, so a stray /effort never breaks a run. */
@@ -32,7 +38,7 @@ export function effortFields(provider: Pick<Provider, 'kind' | 'baseUrl'>, model
 }
 
 export class Providers {
-  constructor(private store: Store, private auth: ChatGPTAuth) {}
+  constructor(private store: Store, private auth: ChatGPTAuth, readonly claude = new ClaudeCode()) {}
   private async key(provider: Provider) { return provider.kind === 'chatgpt' ? this.auth.token(provider.id) : this.store.secret(`provider:${provider.id}`) }
   private async headers(provider: Provider): Promise<Record<string, string>> {
     const key = await this.key(provider)
@@ -41,6 +47,7 @@ export class Providers {
       : { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) }
   }
   async models(provider: Provider): Promise<string[]> {
+    if (provider.kind === 'claude-code') return CLAUDE_CODE_MODELS
     const baseUrl = provider.kind === 'chatgpt' ? 'https://api.openai.com/v1' : validateEndpoint(provider.baseUrl)
     const response = await checkedFetch(`${baseUrl}/models`, { headers: await this.headers(provider) })
     const data = await response.json() as { data?: { id: string }[]; models?: { slug: string; visibility?: string }[] }
@@ -49,6 +56,7 @@ export class Providers {
     return models
   }
   async turn(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void, options: TurnOptions = { maxOutputTokens: 4096 }): Promise<TurnResult> {
+    if (provider.kind === 'claude-code') return this.claudeCode(provider, model, turns, tools, signal, delta, options)
     if (provider.kind === 'anthropic') return this.anthropic(provider, model, turns, tools, signal, delta, options)
     if (provider.kind === 'chatgpt') return this.responses(provider, model, turns, tools, signal, delta, options)
     const response = await checkedFetch(`${validateEndpoint(provider.baseUrl)}/chat/completions`, {
@@ -96,6 +104,12 @@ export class Providers {
     }
     if (!completed) throw new Error('ChatGPT stream ended without response.completed.')
     return { text, tokens, calls, usage }
+  }
+  private async claudeCode(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void, options: TurnOptions): Promise<TurnResult> {
+    if (!options.execute) throw new Error('Claude Code connections run through the agent runtime.')
+    const result = await this.claude.turn({ executable: provider.baseUrl, model, effort: options.effort, turns, tools, signal, onText: delta, execute: options.execute, maxToolCalls: options.maxToolCalls ?? 24, tokenLimit: options.tokenLimit ?? Infinity })
+    // Tool calls already ran inside Claude Code's loop, so there is nothing left for the runtime to execute.
+    return { text: result.text, calls: [], tokens: result.tokens, usage: result.usage }
   }
   private async anthropic(provider: Provider, model: string, turns: Turn[], tools: ToolSpec[], signal: AbortSignal, delta: (text: string) => void, options: TurnOptions): Promise<TurnResult> {
     const messages: { role: string; content: Record<string, unknown>[] }[] = []

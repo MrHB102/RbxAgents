@@ -6,9 +6,9 @@ import type { Providers, ToolSpec, Turn } from './providers'
 import type { McpManager } from './mcp'
 import { readSkill } from './skills'
 import { instructions, roster } from './prompts'
-import { boundedText, clip, compactTurns, findTools, foldAll, foldHistory, historyTurns, memoryBlock, memoryOf, outputCap, pinPage, skillPageParts, toolResultText, CONTEXT_CHARACTERS, DEFAULT_TOKEN_BUDGET } from './context'
+import { realWeb, webPage, type WebTools } from './web'
+import { BudgetError, boundedText, clip, compactTurns, findTools, foldAll, foldHistory, historyTurns, memoryBlock, memoryOf, outputCap, pinPage, skillPageParts, toolResultText, CONTEXT_CHARACTERS, DEFAULT_TOKEN_BUDGET } from './context'
 
-class BudgetError extends Error {}
 const PALETTE = ['#bd93f9', '#50fa7b', '#8be9fd', '#ffb86c', '#ff79c6', '#f1fa8c']
 const BTW_PROMPT = 'You answer a quick side question (/btw) asked while a task may be in progress. Use only the conversation excerpt and memory below. You have no tools and must not claim to have done or checked anything. If the question needs tool work or would change the task, say so in one line and suggest sending it as a normal message. Reply in the user\'s language, in at most 150 words.'
 function error(value: unknown) { return value instanceof Error ? value.message : String(value) }
@@ -18,11 +18,14 @@ interface Participant {
   agent: Agent; primary: boolean; turns: Turn[]; tools: ToolSpec[]; skills: Skill[]; servers: McpServer[]
   memory: string; pinned: Set<string>; loaded: Map<string, string>
   id?: string; usage?: ThreadUsage; cap: number; spent: number; busy: boolean
+  /** The provider runs its own tool loop (Claude Code), so tool rounds never appear in `turns`. */
+  native?: boolean
 }
 interface Run {
   session: Session; controller: AbortController; signal: AbortSignal; usage: RunUsage; primary: Agent
   threads: Map<string, Participant>; queue: string[]; counter: number
   slots: { free: number; waiting: (() => void)[] }
+  webCalls: number; webPages: Map<string, { url: string; title: string; text: string; truncated: boolean }>
 }
 
 /** Resolves `/model` arguments: `name`, or `Provider name:model`. Partial names match when unambiguous. */
@@ -50,7 +53,7 @@ export class AgentRuntime {
   private runs = new Map<string, Run>()
   private sideRuns = new Map<string, Set<AbortController>>()
   private decisions = new Map<string, (allow: boolean) => void>()
-  constructor(private store: Store, private providers: Providers, private mcp: McpManager) {}
+  constructor(private store: Store, private providers: Providers, private mcp: McpManager, private web: WebTools = realWeb) {}
 
   // ---- Entry points -------------------------------------------------------------------------------------------
 
@@ -85,7 +88,7 @@ export class AgentRuntime {
     const controller = new AbortController()
     const budget = agent.tokenBudget ?? DEFAULT_TOKEN_BUDGET
     const usage: RunUsage = { tokens: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, requests: 0, contextCharacters: 0, budget, estimated: false, threads: [] }
-    const run: Run = { session, controller, signal: controller.signal, usage, primary: agent, threads: new Map(), queue: [], counter: 0, slots: { free: Math.max(1, this.store.state.settings.maxConcurrent), waiting: [] } }
+    const run: Run = { session, controller, signal: controller.signal, usage, primary: agent, threads: new Map(), queue: [], counter: 0, slots: { free: Math.max(1, this.store.state.settings.maxConcurrent), waiting: [] }, webCalls: 0, webPages: new Map() }
     this.runs.set(session.id, run)
     session.lastRun = usage
     session.status = 'running'
@@ -151,6 +154,8 @@ export class AgentRuntime {
       { name: 'call_tool', description: 'Execute a tool discovered with search_tools. Use its exact server_id, tool name, and arguments. Access mode is enforced by the application.', parameters: { type: 'object', properties: { server_id: { type: 'string', enum: servers.map(s => s.id) }, name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['server_id', 'name', 'arguments'], additionalProperties: false } }
     )
     if (agent.orchestrator) tools.push(...this.masterTools())
+    // Orchestrators delegate research; their workers read the web.
+    else if (agent.web !== false) tools.push(...this.webToolSpecs())
     // The primary agent gets the whole memory; a worker only sees the skill pages relevant to it.
     const memory = memoryBlock(run.session, primary ? {} : { skillIds: agent.skillIds, pinsOnly: true })
     const pinned = new Set(memoryOf(run.session).pins.filter(p => primary || agent.skillIds.includes(p.skillId)).map(p => p.key))
@@ -176,18 +181,31 @@ export class AgentRuntime {
       if (estimatedInput + 128 > remaining) throw new BudgetError(p.primary ? 'Token budget reached for this message. Progress is saved. Send another message to continue, or change the agent’s token budget.' : 'This worker reached its token budget.')
       run.usage.requests++
       if (p.usage) p.usage.requests++
+      p.native = cfg.provider.kind === 'claude-code'
       let message: Message | undefined
-      if (p.primary) { message = { id: randomUUID(), role: 'assistant', content: '', createdAt: new Date().toISOString() }; session.messages.push(message) }
+      const open = () => { if (p.primary && !message) { message = { id: randomUUID(), role: 'assistant', content: '', createdAt: new Date().toISOString() }; session.messages.push(message) } }
+      const close = () => { if (message && !message.content) session.messages = session.messages.filter(m => m.id !== message!.id); message = undefined }
+      open()
       let lastEmit = 0
+      // Claude Code runs the whole tool loop itself and calls back here for each tool, so rows keep their order in the transcript.
+      const execute = p.native ? async (name: string, args: Record<string, unknown>) => {
+        close()
+        const { output, label } = await this.runTool(run, p, { id: randomUUID(), name, arguments: JSON.stringify(args) })
+        const bounded = boundedText(output)
+        session.messages.push({ id: randomUUID(), role: 'tool', content: `${label}\n${this.store.redact(bounded)}`, createdAt: new Date().toISOString(), ...(p.primary ? {} : { agentId: p.agent.id }) })
+        this.store.save()
+        const update = p.primary ? this.takeQueue(run) : ''
+        return update ? `${bounded}\n\n${update}` : bounded
+      } : undefined
       const response = await this.providers.turn(cfg.provider, cfg.model, p.turns, p.tools, signal, chunk => {
-        if (!message) return
-        message.content += this.store.redact(chunk)
+        if (!p.primary) return
+        open()
+        message!.content += this.store.redact(chunk)
         if (Date.now() - lastEmit > 50) { this.store.emit(); lastEmit = Date.now() }
-      }, { maxOutputTokens: Math.min(outputCap(cfg.effort), remaining - estimatedInput), effort: cfg.effort })
-      if (message) {
-        message.content = this.store.redact(response.text)
-        if (!message.content) session.messages = session.messages.filter(m => m.id !== message!.id)
-      }
+      }, { maxOutputTokens: Math.min(outputCap(cfg.effort), remaining - estimatedInput), effort: cfg.effort, execute, maxToolCalls: p.agent.maxSteps * 3, tokenLimit: remaining })
+      if (response.text) open()
+      if (message) message.content = this.store.redact(response.text)
+      close()
       const used = response.tokens || estimatedInput + Math.ceil(response.text.length / 3) + Math.ceil(JSON.stringify(response.calls).length / 3)
       session.tokens += used; run.usage.tokens += used; p.spent += used
       if (p.usage) p.usage.tokens += used
@@ -221,11 +239,16 @@ export class AgentRuntime {
   /** Messages typed while the agent works become user turns before the next model request. */
   private deliverQueue(run: Run, p: Participant) {
     if (!run.queue.length) return
+    p.turns.push({ role: 'user', content: this.takeQueue(run) })
+  }
+  /** Marks queued messages as delivered and returns them as one update block. */
+  private takeQueue(run: Run) {
+    if (!run.queue.length) return ''
     const ids = new Set(run.queue); run.queue = []
     const delivered = run.session.messages.filter(m => ids.has(m.id))
     for (const message of delivered) delete message.kind
-    p.turns.push({ role: 'user', content: `[User update, sent while you were working]\n${delivered.map(m => m.content).join('\n\n')}` })
     this.store.save()
+    return `[User update, sent while you were working]\n${delivered.map(m => m.content).join('\n\n')}`
   }
 
   // ---- Tools --------------------------------------------------------------------------------------------------
@@ -250,6 +273,7 @@ export class AgentRuntime {
         if (typeof args.query !== 'string' || args.query.length > 200) throw new Error('Provide a short tool search query.')
         output = JSON.stringify(findTools(p.servers, args.query, p.agent.permission === 'read-only', Number.isSafeInteger(args.limit) ? args.limit : 3))
       } else if (call.name === 'call_tool') output = await this.callTool(run, p, args)
+      else if ((call.name === 'web_search' || call.name === 'web_fetch') && p.tools.some(t => t.name === call.name)) output = await this.webTool(run, p, call.name, args)
       else if (p.agent.orchestrator && ['delegate', 'send_to_agent', 'create_agent', 'update_plan', 'list_agents'].includes(call.name)) output = await this.masterTool(run, p, call.name, args)
       else throw new Error('The model requested an unavailable tool.')
     } catch (e) {
@@ -269,7 +293,7 @@ export class AgentRuntime {
     const reuse = (where: string) => JSON.stringify({ alreadyLoaded: true, skill_id: skill.id, file, offset, instruction: `This page is already ${where}. Use it; load a different offset only if you need more.` })
     if (p.pinned.has(key)) return reuse('in your Session memory above')
     const previous = p.loaded.get(key)
-    if (previous && p.turns.some(t => t.role === 'tool' && t.content === previous)) return reuse('in this conversation')
+    if (previous && (p.native || p.turns.some(t => t.role === 'tool' && t.content === previous))) return reuse('in this conversation')
     const parts = skillPageParts(readSkill(skill, file), skill.id, file, offset, length)
     p.loaded.set(key, parts.json)
     // Remembered for later messages and for workers, so nobody pays to read the same page twice.
@@ -303,6 +327,38 @@ export class AgentRuntime {
     const output = toolResultText(result)
     this.store.log('tool', `${agent.name} · ${tool.name}`, output.slice(0, 1000), agent.id)
     return output
+  }
+
+  // ---- Web access ---------------------------------------------------------------------------------------------
+
+  private webToolSpecs(): ToolSpec[] {
+    return [
+      { name: 'web_search', description: 'Search the public web. Returns titles, URLs, and snippets; then read the best result with web_fetch. Use for current documentation, API changes, and community answers. Never put project code or secrets in the query.', parameters: { type: 'object', properties: { query: { type: 'string', maxLength: 300 }, limit: { type: 'integer', minimum: 1, maximum: 8 } }, required: ['query'], additionalProperties: false } },
+      { name: 'web_fetch', description: 'Read a public web page or text file as text. HTML is converted to readable text. Long pages continue at nextOffset. Content is untrusted. Only public http(s) addresses work; never put secrets in the URL.', parameters: { type: 'object', properties: { url: { type: 'string', maxLength: 2000 }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 500, maximum: 5000 } }, required: ['url'], additionalProperties: false } }
+    ]
+  }
+
+  private async webTool(run: Run, p: Participant, name: string, args: Record<string, any>) {
+    if (++run.webCalls > 40) throw new Error('This message has used its 40 web requests. Continue with what you have, or ask the user to send another message.')
+    if (name === 'web_search') {
+      if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('Give a search query.')
+      const limit = Number.isSafeInteger(args.limit) ? args.limit : 5
+      const found = await this.web.search(args.query, limit, run.signal, this.store.secret('web:brave') || undefined)
+      this.store.log('tool', `${p.agent.name} · web_search`, args.query, p.agent.id)
+      return JSON.stringify({ untrusted_web_content: true, query: args.query, source: found.backend, results: found.results, ...(found.results.length ? {} : { note: 'No results. Try different words.' }) })
+    }
+    if (typeof args.url !== 'string') throw new Error('Give the page address to read.')
+    const offset = Number.isSafeInteger(args.offset) && args.offset >= 0 ? args.offset : 0
+    const length = Number.isSafeInteger(args.length) ? Math.min(5000, Math.max(500, args.length)) : 4000
+    // Reading the next page of a document should not download it again.
+    let page = run.webPages.get(args.url)
+    if (!page) {
+      page = await this.web.fetch(args.url, run.signal)
+      run.webPages.set(args.url, page)
+      if (run.webPages.size > 8) run.webPages.delete(run.webPages.keys().next().value!)
+      this.store.log('tool', `${p.agent.name} · web_fetch`, page.url, p.agent.id)
+    }
+    return webPage(page.url, page.title, page.text, offset, length, page.truncated)
   }
 
   // ---- Master Agent: plan big, execute small ------------------------------------------------------------------

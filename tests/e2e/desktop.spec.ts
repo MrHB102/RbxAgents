@@ -60,6 +60,11 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   await page.getByRole('button', { name: 'Close dialog' }).click()
   // Save and discover an OpenAI-compatible provider through the visible form.
   await page.getByRole('button', { name: 'Providers', exact: true }).click()
+  await page.locator('.provider-option').filter({ hasText: 'Claude Code' }).click()
+  await expect(page.getByRole('dialog')).toContainText('never reads or stores them')
+  await expect(page.getByRole('dialog')).toContainText('limit how third-party apps may use')
+  await page.screenshot({ path: 'test-results/claude-code-provider.png' })
+  await page.getByRole('button', { name: 'Close dialog' }).click()
   await page.getByRole('button', { name: 'Add provider', exact: true }).click()
   await page.getByLabel('Connection name').fill('Local integration test')
   await page.getByLabel('API endpoint').fill(apiUrl)
@@ -86,7 +91,7 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   await expect(page.locator('.tool-message')).toContainText('load_skill')
   expect(requests).toHaveLength(2)
   expect(requests[0].max_tokens).toBeLessThanOrEqual(4096)
-  expect(requests[0].tools).toHaveLength(1)
+  expect(requests[0].tools.map((tool: any) => tool.function.name)).toEqual(['load_skill', 'web_search', 'web_fetch'])
   expect(requests[0].messages[0].content).toContain('server')
   expect(requests[1].messages.some((m: any) => m.role === 'tool' && m.content.includes('Architecture'))).toBe(true)
   // Slash commands: suggestions appear, and commands never reach the model.
@@ -104,6 +109,9 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   await page.getByRole('textbox', { name: 'Workspace system prompt' }).fill('Use typed Luau. Verify changes before reporting success.')
   await page.getByRole('button', { name: 'Save changes' }).click()
   await expect(page.getByText('Workspace prompt saved.', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: /^Settings/ }).first().click()
+  await expect(page.getByRole('heading', { name: 'Web access' })).toBeVisible()
+  await expect(page.getByLabel('Brave Search API key')).toBeVisible()
   await page.getByRole('button', { name: 'Activity', exact: true }).click()
   await expect(page.locator('.activity-list')).toContainText('Architect finished')
   // Install the actual bundled plugin into a temporary folder, never the user's Studio folder.

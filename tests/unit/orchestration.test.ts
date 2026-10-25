@@ -6,10 +6,11 @@ import { Store } from '../../src/main/store'
 import { AgentRuntime } from '../../src/main/runtime'
 import type { Providers, Turn } from '../../src/main/providers'
 import type { McpManager } from '../../src/main/mcp'
+import type { WebTools } from '../../src/main/web'
 
 type Script = (call: { who: 'master' | 'worker' | 'side'; turns: Turn[]; tools: any[]; options: any; model: string; index: number }) => Promise<{ text?: string; calls?: { name: string; arguments: object }[] }> | { text?: string; calls?: { name: string; arguments: object }[] }
 
-function fixture(script: Script, configure: (store: Store) => void = () => {}) {
+function fixture(script: Script, configure: (store: Store) => void = () => {}, web?: WebTools) {
   const directory = mkdtempSync(join(tmpdir(), 'rbx-orchestration-'))
   const store = new Store(directory, { available: () => false, encrypt: () => Buffer.alloc(0), decrypt: () => '' })
   store.state.providers.push({ id: 'local', name: 'Local', kind: 'openai', baseUrl: 'http://localhost:1234/v1', models: ['big-model', 'small-model', 'other-model'], hasKey: false, status: 'connected' })
@@ -33,7 +34,7 @@ function fixture(script: Script, configure: (store: Store) => void = () => {}) {
     return { text: result.text || '', tokens: 10, calls: (result.calls || []).map((c, i) => ({ id: `call-${index}-${i}`, name: c.name, arguments: JSON.stringify(c.arguments) })) }
   })
   const mcpCall = vi.fn(async () => ({ content: [{ type: 'text', text: 'ok' }] }))
-  const runtime = new AgentRuntime(store, { turn } as unknown as Providers, { connect: vi.fn(async () => {}), call: mcpCall } as unknown as McpManager)
+  const runtime = new AgentRuntime(store, { turn } as unknown as Providers, { connect: vi.fn(async () => {}), call: mcpCall } as unknown as McpManager, web)
   return { store, runtime, turn, calls, mcpCall, cleanup: () => { runtime.close(); rmSync(directory, { recursive: true, force: true }) } }
 }
 const idle = (runtime: AgentRuntime, id: string) => vi.waitFor(() => expect(runtime.isRunning(id)).toBe(false))
@@ -294,5 +295,99 @@ describe('Master Agent', () => {
       await idle(runtime, 'master')
       expect(calls.at(-1)!.turns.filter(t => t.role === 'system').map(t => t.content).join('\n')).toContain('[ ] s2: Build (builder)')
     } finally { cleanup() }
+  })
+})
+
+describe('Claude Code connection', () => {
+  it('keeps transcript order, delivers queued updates inside tool results, and does not reload skill pages', async () => {
+    const f = fixture(() => ({ text: 'unused' }), store => { store.state.providers[0].kind = 'claude-code' })
+    let runtime!: AgentRuntime
+    const seen: { options?: any; outputs: string[] } = { outputs: [] }
+    const turn = vi.fn(async (_provider: unknown, _model: string, _turns: Turn[], _tools: unknown[], _signal: AbortSignal, delta: (t: string) => void, options: any) => {
+      seen.options = options
+      delta('Looking. ')
+      seen.outputs.push(await options.execute('call_tool', { server_id: 'roblox', name: 'get_script_source', arguments: {} }))
+      await runtime.send('scripter', 'Also rename it.')
+      seen.outputs.push(await options.execute('load_skill', { skill_id: 'roblox-luau-core' }))
+      seen.outputs.push(await options.execute('load_skill', { skill_id: 'roblox-luau-core' }))
+      delta('Done.')
+      return { text: 'Done.', tokens: 5, calls: [] }
+    })
+    runtime = new AgentRuntime(f.store, { turn } as unknown as Providers, { connect: vi.fn(async () => {}), call: f.mcpCall } as unknown as McpManager)
+    try {
+      await runtime.send('scripter', 'Inspect it.')
+      await idle(runtime, 'scripter')
+      const session = f.store.state.sessions.find(s => s.id === 'scripter')!
+      expect(session.messages.map(m => `${m.role}:${m.content.split('\n')[0]}`)).toEqual(expect.arrayContaining(['user:Inspect it.', 'assistant:Looking. ', 'tool:get_script_source {}', 'assistant:Done.']))
+      const roles = session.messages.filter(m => m.kind !== 'queued').map(m => m.role)
+      expect(roles.indexOf('assistant')).toBeLessThan(roles.indexOf('tool'))
+      expect(roles.lastIndexOf('assistant')).toBeGreaterThan(roles.lastIndexOf('tool'))
+      expect(seen.outputs[0]).toContain('ok')
+      expect(seen.outputs[1]).toContain('LUAU CORE KNOWLEDGE')
+      expect(seen.outputs[1]).toContain('[User update, sent while you were working]\nAlso rename it.')
+      expect(seen.outputs[2]).toContain('alreadyLoaded')
+      expect(session.messages.some(m => m.kind === 'queued')).toBe(false)
+      expect(seen.options).toMatchObject({ maxToolCalls: 36, tokenLimit: expect.any(Number) })
+      expect(session.lastRun?.tokens).toBe(5)
+    } finally { f.cleanup(); runtime.close() }
+  })
+})
+
+describe('web access', () => {
+  const page = { url: 'https://create.roblox.com/docs/x', title: 'Docs', text: 'Heartbeat runs every frame. '.repeat(400), truncated: false }
+  const stub = () => {
+    const calls = { search: [] as string[], fetch: [] as string[] }
+    const web: WebTools = {
+      search: async (query, _limit, _signal, key) => { calls.search.push(`${query}|${key ?? ''}`); return { backend: key ? 'brave' : 'duckduckgo', results: [{ title: 'RunService', url: 'https://create.roblox.com/docs/x', snippet: 'Service.' }] } },
+      fetch: async url => { calls.fetch.push(url); return page }
+    }
+    return { web, calls }
+  }
+  const toolOutputs = (store: Store, id: string) => store.state.sessions.find(s => s.id === id)!.messages.filter(m => m.role === 'tool').map(m => m.content)
+
+  it('gives workers search and fetch, not the Master, and lets an agent switch them off', async () => {
+    const { web } = stub()
+    const f = fixture(({ who, index }) => who === 'master' && index === 0 ? { calls: [{ name: 'delegate', arguments: { tasks: [{ agent_id: 'scripter', brief: 'Research.' }] } }] } : { text: 'Done.' }, store => { store.state.agents.find(a => a.id === 'reviewer')!.web = false }, web)
+    try {
+      await f.runtime.send('master', 'Go.'); await idle(f.runtime, 'master')
+      expect(f.calls.find(c => c.who === 'master')!.tools.map(t => t.name)).not.toContain('web_fetch')
+      expect(f.calls.find(c => c.who === 'worker')!.tools.map(t => t.name)).toEqual(expect.arrayContaining(['web_search', 'web_fetch']))
+      await f.runtime.send('reviewer', 'Check.'); await idle(f.runtime, 'reviewer')
+      expect(f.calls.at(-1)!.tools.map(t => t.name)).not.toContain('web_search')
+    } finally { f.cleanup() }
+  })
+
+  it('returns untrusted, bounded results, pages through a document with one download, and passes the saved search key', async () => {
+    const { web, calls } = stub()
+    const f = fixture(({ turns, index }) => {
+      if (index === 0) return { calls: [{ name: 'web_search', arguments: { query: 'RunService Heartbeat' } }] }
+      if (index === 1) return { calls: [{ name: 'web_fetch', arguments: { url: 'https://create.roblox.com/docs/x' } }] }
+      if (index === 2) return { calls: [{ name: 'web_fetch', arguments: { url: 'https://create.roblox.com/docs/x', offset: 4000 } }] }
+      return { text: `pages=${turns.filter(t => t.role === 'tool').length}` }
+    }, store => store.setSecret('web:brave', 'brave-test-key'), web)
+    try {
+      await f.runtime.send('architect', 'Research it.'); await idle(f.runtime, 'architect')
+      const [search, first, second] = toolOutputs(f.store, 'architect').map(o => JSON.parse(o.split('\n').slice(1).join('\n')))
+      expect(search).toMatchObject({ untrusted_web_content: true, source: 'brave', results: [{ url: 'https://create.roblox.com/docs/x' }] })
+      expect(calls.search).toEqual(['RunService Heartbeat|brave-test-key'])
+      expect(first).toMatchObject({ untrusted_web_content: true, offset: 0, title: 'Docs' })
+      expect(first.nextOffset).toBeGreaterThan(0)
+      expect(second.offset).toBe(4000)
+      expect(JSON.stringify(first).length).toBeLessThanOrEqual(6000)
+      expect(calls.fetch).toHaveLength(1)
+      expect(JSON.stringify(f.store.state.sessions)).not.toContain('brave-test-key')
+    } finally { f.cleanup() }
+  })
+
+  it('reports web errors to the model and stops after 40 requests in one message', async () => {
+    const web: WebTools = { search: async () => ({ backend: 'duckduckgo', results: [] }), fetch: async () => { throw new Error('The site answered 404 (not found).') } }
+    const f = fixture(({ index }) => index < 41 ? { calls: [{ name: 'web_fetch', arguments: { url: `https://example.com/${index}` } }] } : { text: 'Stopping.' }, store => { store.state.agents.find(a => a.id === 'architect')!.maxSteps = 60 }, web)
+    try {
+      await f.runtime.send('architect', 'Crawl.'); await idle(f.runtime, 'architect')
+      const outputs = toolOutputs(f.store, 'architect')
+      expect(outputs[0]).toContain('404')
+      expect(outputs.at(-1)).toContain('40 web requests')
+      expect(outputs.filter(o => o.includes('404'))).toHaveLength(40)
+    } finally { f.cleanup() }
   })
 })

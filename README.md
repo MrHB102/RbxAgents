@@ -20,8 +20,9 @@ Built with a clean Dracula-inspired interface, a complete Roblox skill library, 
 
 - **Build your team.** Create, duplicate, pause, and configure agents. Start with a Master, Architect, Builder, Scripter, and Reviewer.
 - **Let a Master Agent run the team.** The Master plans, delegates self-contained briefs to your specialists in parallel, and synthesizes their reports. Put a strong model on the Master and cheaper ones on the workers. It can propose new agents, but you must approve each one, even in Unrestricted mode. See [docs/MASTER_AGENT.md](docs/MASTER_AGENT.md).
+- **Reach the internet.** Agents can search the web and read public pages (`web_search`, `web_fetch`), for example current Roblox documentation and DevForum answers. Local and private addresses are blocked. See [Web access](#web-access).
 - **Steer while it works.** Send a message at any time: it is delivered before the agent's next step. Use `/btw` for a side question, `/model` and `/effort` to change model and reasoning depth from the chat.
-- **Choose a model for each agent.** Connect OpenAI-compatible APIs, local inference servers, Anthropic, or an eligible ChatGPT account. Discover models or enter a model ID yourself.
+- **Choose a model for each agent.** Connect OpenAI-compatible APIs, local inference servers, Anthropic, your installed Claude Code, or an eligible ChatGPT account. Discover models or enter a model ID yourself.
 - **Set their instructions.** Combine a workspace system prompt, individual agent instructions, and selected skills.
 - **Use all 29 Roblox skills offline.** The complete [roblox-brain](https://github.com/tabooharmony/roblox-brain) library ships with the app, including every `references/full.md`. Import additional local skill collections.
 - **Connect directly to Studio.** The [Chrrxs Roblox Studio MCP](https://github.com/Chrrxs/robloxstudio-mcp) server and matching plugin are bundled. Install the plugin from inside the app without a separate Node.js installation.
@@ -99,6 +100,22 @@ You do not have to wait for an agent to finish. A message sent while it works ap
 
 The composer also has model and effort selectors. Text such as `/Workspace/Map is broken` is sent normally because only the commands above are recognized.
 
+### Web access
+
+Every agent except an orchestrator gets two tools, which you can switch off per agent under **Configure → Connections**:
+
+- `web_search` returns titles, URLs, and snippets. It uses DuckDuckGo by default, which needs no account but can rate limit automated searches. Add an optional **Brave Search API key** in **Settings → Web access** for a more reliable engine; the key is stored in the credential vault and sent only to Brave.
+- `web_fetch` reads a public page or text file. HTML becomes readable text with headings, lists, code blocks, and links; long documents continue with `nextOffset`, and later pages of the same document are not downloaded again. A Master Agent has no web tools; its workers research for it.
+
+Because a model chooses the addresses and page text can try to steer it, the app limits what it can do:
+
+- Only the public internet: loopback, private, link-local, and cloud-metadata addresses are refused, including when a public name resolves to one and after every redirect. Only ports 80 and 443; no usernames in URLs.
+- GET only, with no cookies or credentials. Text pages and data files only (no images, PDFs, or downloads), at most 2 MB, 15 seconds, and 5 redirects.
+- Results carry `untrusted_web_content: true`, and the prompts tell agents to ignore instructions found in pages and never to put project code or secrets in a query or URL.
+- At most 40 web requests per message. Tool calls are listed in the chat and under **Activity**.
+
+Web access does not need approval in any access mode, because it changes nothing in Studio. Search queries go to the search engine, page requests go to the websites, and page text becomes part of what is sent to your model provider.
+
 ### Unrestricted access
 
 Open **Agents → Configure → Permissions → Unrestricted access**, then save. The agent runs its available MCP tools without application approval prompts, including writes. Switching to this mode also releases pending application approvals for that agent, except requests to create a new agent, which always wait for you. Switching to Read only blocks subsequent mutations. Provider permissions, MCP server restrictions, Stop, step limits, and token budgets still apply.
@@ -108,6 +125,7 @@ Open **Agents → Configure → Permissions → Unrestricted access**, then save
 | OpenAI-compatible | Your API key, or no key for a local server | Streaming Chat Completions with function tools |
 | Anthropic | Your Anthropic API key | Streaming Messages API with tool use |
 | ChatGPT | Browser authorization for RBX Agents | Public Responses API, using eligible ChatGPT plan usage |
+| Claude Code | Claude Code's own sign-in, on Anthropic's site | The `claude` program installed on this computer, driven headlessly |
 
 Built-in endpoint presets include OpenAI, OpenRouter, Ollama, and LM Studio. A compatible provider must support streaming chat completions and function tools to use the full agent runtime. Local HTTP is accepted on loopback addresses; remote endpoints require HTTPS. Endpoints should include their API path, usually `/v1`.
 
@@ -124,9 +142,22 @@ The app implements the documented [Sign in with ChatGPT flow for local and open-
 
 Availability depends on OpenAI’s current eligibility rules, account, plan, workspace, and permissions. Creating a connection does not grant model access. This integration does not read your ChatGPT conversation history. A paid or hosted distribution may require separate approval from OpenAI; consult the current official documentation before changing the distribution model.
 
-### Claude and Claude Desktop
+### Claude: API key, or your installed Claude Code
 
-RBX Agents currently supports **Claude through the Anthropic API**. It does not offer a third-party Claude.ai subscription login or reuse Claude Desktop session tokens. Anthropic requires third-party applications to follow its [authentication and credential-use guidance](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). Native Claude Code integration is not implemented in this preview.
+There are two ways to use Claude:
+
+- **Anthropic API key.** Add an **Anthropic** connection. This is the route Anthropic documents for products built on Claude.
+- **Claude Code.** Add a **Claude Code** connection, then select **Sign in with Claude**. The app runs `claude auth login`, which opens Anthropic's sign-in page and completes there. The same connection can use a Claude subscription or whatever Claude Code itself is signed in with.
+
+How the Claude Code connection works:
+
+- RBX Agents starts your own, unmodified `claude` program for each model turn (`claude -p`, streaming JSON). It was tested with Claude Code 2.1.310 and is found on your PATH or at the path you choose. A `.cmd` wrapper is not supported; use the native `claude.exe`.
+- **The app never reads, copies, or stores Claude credentials or tokens.** Sign-in belongs to Claude Code. Only the account kind and Claude Code's version are shown in the app. Signing out of the app connection does not sign Claude Code out.
+- Claude Code's built-in tools are switched off (`--tools ""`), user settings, slash commands, and other MCP servers are not loaded, and it runs in an empty temporary folder, so no project settings or memory files are found. Its only tools are the ones this app offers (`search_tools`, `call_tool`, `load_skill`, `web_search`, `web_fetch`, and the Master's delegation tools) through a loopback MCP server that exists for one turn and requires a random bearer token. Every call goes through the agent's access mode, approvals, step limit, and token budget.
+- Messages you send while it works are delivered inside its next tool result, so steering works here too. Step limits count tool calls (three per step). `/model` accepts `fable`, `opus`, `sonnet`, `haiku`, or a full model ID, and `/effort` maps to Claude Code's `--effort`.
+- It starts a process per turn, so each turn has a short startup cost.
+
+**Anthropic's terms matter here.** Their [authentication and credential-use guidance](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) says OAuth sign-in is for Claude Code and Anthropic's own apps, that developers building products should use API keys, and that third-party apps may not offer Claude.ai login or route requests through Free, Pro, or Max plan credentials on behalf of users. The same page allows a person to sign in to the unmodified Claude Code binary with their own subscription. This connection keeps credentials entirely inside Claude Code, but whether driving it from another application is within Anthropic's terms is Anthropic's call, not this project's, and they state they may enforce their rules without notice. If that risk is not acceptable for you, use an API key.
 
 ## Bundled Roblox skills
 
@@ -214,14 +245,14 @@ The desktop end-to-end test starts an isolated Electron profile and a local test
 Data is saved under Electron’s per-user application data directory, typically `%APPDATA%/rbx-agents` on Windows and `$XDG_CONFIG_HOME/rbx-agents` or `~/.config/rbx-agents` on Linux.
 
 - `workspace.json`: settings, agent definitions, provider metadata, conversations, skills, MCP configuration, and the latest 500 activity events.
-- `credentials.enc`: encrypted API keys, HTTP MCP bearer tokens, and ChatGPT credentials, when secure OS storage is available.
+- `credentials.enc`: encrypted API keys, HTTP MCP bearer tokens, the optional Brave Search key, and ChatGPT credentials, when secure OS storage is available.
 - `skills/`: imported local skill collections.
 
 On Windows, credential encryption uses the OS-backed Electron `safeStorage` implementation. On Linux, the app requires an available secure keyring and rejects the `basic_text` fallback. Without a secure keyring, credentials remain in memory for the current session only. Conversations and configuration are not encrypted at rest.
 
 The renderer has no Node.js access. A narrow preload bridge validates actions in the main process. Credentials are excluded from state snapshots and exports. Provider requests are sent from the main process, and known credentials are redacted from error/activity output. No analytics or telemetry service is configured.
 
-Messages, selected skill content, and MCP tool results are sent to the provider selected for the conversation. Local storage does not make a remote provider’s inference private to your device.
+Messages, selected skill content, MCP tool results, and web page text are sent to the provider selected for the conversation. Local storage does not make a remote provider’s inference private to your device.
 
 ## Architecture
 
@@ -240,11 +271,11 @@ Independent agent conversations can run concurrently. Each uses a snapshot of it
 
 ## Current limitations
 
-- Live ChatGPT OAuth, live Anthropic inference, and real Studio place edits require the user’s account and Studio connection; fixture tests do not establish those external services’ availability.
+- Live ChatGPT OAuth, live Anthropic API inference, and real Studio place edits require the user’s account and Studio connection; fixture tests do not establish those external services’ availability.
 - This preview has text-based agent conversations. Image attachments and multimodal screenshot feedback are not implemented.
 - The Master Agent delegates within one message: worker threads live for that message, and a worker cannot see the conversation or other workers. Workers do not run in the background after the Master answers, and there is no shared task board between conversations.
 - The project folder setting labels your workspace. Direct project filesystem tools, terminal access, and Rojo synchronization are not implemented; Studio access goes through MCP.
-- MCP OAuth discovery, automatic skill updates, configuration import, automatic application updates, signed releases, and native Claude Code integration are not implemented.
+- MCP OAuth discovery, automatic skill updates, configuration import, automatic application updates, and signed releases are not implemented.
 - The app serializes its own Studio calls. It cannot coordinate external MCP clients or manual Studio edits made at the same time.
 
 ## Credits and license

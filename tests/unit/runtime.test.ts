@@ -108,8 +108,10 @@ describe('agent tool permissions', () => {
       await runtime.send('session', 'Make the change.')
       await vi.waitFor(() => expect(runtime.isRunning('session')).toBe(false))
       const requestTools = turn.mock.calls[0][3]
-      expect(requestTools.map((t: any) => t.name)).toEqual(['search_tools', 'call_tool'])
-      expect(JSON.stringify(requestTools).length).toBeLessThan(2000)
+      expect(requestTools.map((t: any) => t.name)).toEqual(['search_tools', 'call_tool', 'web_search', 'web_fetch'])
+      // The 50 large MCP tools add nothing: the gateway is the same small pair, and the web pair is fixed-size.
+      expect(JSON.stringify(requestTools.slice(0, 2)).length).toBeLessThan(2000)
+      expect(JSON.stringify(requestTools).length).toBeLessThan(3500)
       expect(store.state.sessions[0].lastRun?.tokens).toBe(2)
       expect(store.state.sessions[0].tokens).toBe(400_002)
       expect(store.state.sessions[0].lastRun?.requests).toBe(2)

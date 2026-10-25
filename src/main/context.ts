@@ -12,6 +12,9 @@ export const DIGEST_CHARACTERS = 3_500
 export const KEEP_EXCHANGES = 3
 const HISTORY_ANSWER_CHARACTERS = 3_000
 
+/** The run, or one worker, has used its token allowance. */
+export class BudgetError extends Error {}
+
 export function clip(text: string, limit: number) {
   const flat = text.replace(/\s+/g, ' ').trim()
   return flat.length <= limit ? flat : `${flat.slice(0, Math.max(0, limit - 1))}…`

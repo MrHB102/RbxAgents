@@ -11,6 +11,7 @@ import { Providers } from './providers'
 import { McpManager } from './mcp'
 import { AgentRuntime } from './runtime'
 import { validateEndpoint } from './http'
+import { CLAUDE_CODE_MODELS } from './claudecode'
 import { EFFORTS } from '../shared/commands'
 import type { Agent, McpServer, Provider } from '../shared/types'
 
@@ -19,9 +20,9 @@ const short = z.string().trim().min(1).max(200)
 const agentSchema = z.object({
   id, name: short, role: short, description: z.string().max(2000), color: z.string().regex(/^#[a-fA-F0-9]{6}$/),
   providerId: z.string().max(100), model: z.string().max(200), systemPrompt: z.string().max(100_000), skillIds: z.array(id).max(300), mcpIds: z.array(id).max(30), enabled: z.boolean(), permission: z.enum(['ask', 'read-only', 'unrestricted']), maxSteps: z.number().int().min(1).max(100), tokenBudget: z.number().int().min(1000).max(1_000_000).default(30_000),
-  effort: z.enum(EFFORTS).optional(), orchestrator: z.boolean().optional()
+  effort: z.enum(EFFORTS).optional(), orchestrator: z.boolean().optional(), web: z.boolean().optional()
 })
-const providerSchema = z.object({ id, name: short, kind: z.enum(['openai', 'anthropic', 'chatgpt']), baseUrl: z.string().max(2000), apiKey: z.string().max(20_000).optional(), models: z.array(z.string().max(200)).max(1000).default([]) })
+const providerSchema = z.object({ id, name: short, kind: z.enum(['openai', 'anthropic', 'chatgpt', 'claude-code']), baseUrl: z.string().max(2000), apiKey: z.string().max(20_000).optional(), models: z.array(z.string().max(200)).max(1000).default([]) })
 const serverSchema = z.object({ id, name: short, transport: z.enum(['bundled', 'stdio', 'http', 'sse']), command: z.string().max(4000), args: z.array(z.string().max(4000)).max(100), url: z.string().max(2000), env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string().max(4000)), pluginDirectory: z.string().max(4000), token: z.string().max(20_000).optional() })
 
 let mainWindow: BrowserWindow | null = null
@@ -31,6 +32,7 @@ let providers: Providers
 let mcp: McpManager
 let runtime: AgentRuntime
 let quitting = false
+const claudeLogins = new Map<string, AbortController>()
 const rendererFile = join(import.meta.dirname, '../renderer/index.html')
 const devUrl = !app.isPackaged ? process.env.ELECTRON_RENDERER_URL : undefined
 const testDirectory = !app.isPackaged ? process.env.RBX_AGENTS_TEST_DATA : undefined
@@ -87,12 +89,13 @@ async function action(name: string, payload: unknown): Promise<unknown> {
       const data = providerSchema.parse(payload)
       requireIdleProvider(data.id)
       if (data.kind === 'chatgpt') data.baseUrl = 'https://api.openai.com/v1'
-      const baseUrl = validateEndpoint(data.baseUrl)
+      // For Claude Code the endpoint field holds an optional path to the claude executable.
+      const baseUrl = data.kind === 'claude-code' ? data.baseUrl.trim() : validateEndpoint(data.baseUrl)
       const existing = store.state.providers.find(p => p.id === data.id)
       if (existing && existing.kind !== data.kind) throw new Error('Create a new provider to change its type.')
       if (existing && existing.baseUrl !== baseUrl && data.apiKey === undefined && store.secret(`provider:${data.id}`)) throw new Error('Enter the API key again when changing its endpoint.')
       if (data.apiKey !== undefined) store.setSecret(`provider:${data.id}`, data.apiKey.trim())
-      const provider: Provider = { id: data.id, name: data.name, kind: data.kind, baseUrl, models: data.models, hasKey: data.kind === 'chatgpt' ? !!auth.account(data.id)?.accessToken : !!store.secret(`provider:${data.id}`), status: 'disconnected', account: existing?.account }
+      const provider: Provider = { id: data.id, name: data.name, kind: data.kind, baseUrl, models: data.kind === 'claude-code' ? CLAUDE_CODE_MODELS : data.models, hasKey: data.kind === 'chatgpt' ? !!auth.account(data.id)?.accessToken : !!store.secret(`provider:${data.id}`), status: 'disconnected', account: existing?.account }
       if (existing) store.state.providers[store.state.providers.indexOf(existing)] = provider
       else store.state.providers.push(provider)
       store.save(); return provider
@@ -100,6 +103,11 @@ async function action(name: string, payload: unknown): Promise<unknown> {
     case 'provider:test': {
       const provider = providerFor(id.parse(payload))
       try {
+        if (provider.kind === 'claude-code') {
+          const status = await providers.claude.status(provider.baseUrl)
+          if (!status.loggedIn) throw new Error('Claude Code is installed but not signed in. Select Sign in with Claude.')
+          provider.account = `${status.authMethod === 'claude.ai' ? 'Claude subscription' : status.apiProvider && status.apiProvider !== 'firstParty' ? `Claude via ${status.apiProvider}` : 'Anthropic Console'}${status.version ? ` · Claude Code ${status.version}` : ''}`
+        }
         provider.models = await providers.models(provider); provider.status = 'connected'; provider.error = undefined
         store.log('success', `${provider.name} connected`, `${provider.models.length} models available.`)
         return provider.models
@@ -107,13 +115,22 @@ async function action(name: string, payload: unknown): Promise<unknown> {
     }
     case 'provider:login': {
       const provider = providerFor(id.parse(payload))
+      if (provider.kind === 'claude-code') {
+        // Claude Code runs its own sign-in on Anthropic's site. This app never receives the credentials.
+        if (claudeLogins.has(provider.id)) throw new Error('A sign-in is already waiting. Finish it in your browser or cancel it.')
+        const controller = new AbortController(); claudeLogins.set(provider.id, controller)
+        try {
+          await providers.claude.login(provider.baseUrl, controller.signal, url => { provider.loginUrl = url; store.emit() })
+          return await action('provider:test', provider.id)
+        } finally { claudeLogins.delete(provider.id); provider.loginUrl = undefined; store.emit() }
+      }
       if (provider.kind !== 'chatgpt') throw new Error('Browser sign-in is available for ChatGPT connections.')
       requireIdleProvider(provider.id)
       await auth.signIn(provider.id)
       if (provider.status === 'connected') return action('provider:test', provider.id)
       return
     }
-    case 'provider:cancel': auth.cancel(id.parse(payload)); return
+    case 'provider:cancel': { const providerId = id.parse(payload); claudeLogins.get(providerId)?.abort(); auth.cancel(providerId); return }
     case 'provider:logout': {
       const provider = providerFor(id.parse(payload)); requireIdleProvider(provider.id)
       const result = provider.kind === 'chatgpt' ? await auth.logout(provider.id) : { revoked: true }
@@ -200,6 +217,11 @@ async function action(name: string, payload: unknown): Promise<unknown> {
     case 'settings:save': {
       const settings = z.object({ workspace: z.string().max(4000), globalPrompt: z.string().max(100_000), maxConcurrent: z.number().int().min(1).max(8) }).parse(payload)
       store.state.settings = settings; store.save(); return
+    }
+    case 'web:key': {
+      // Optional Brave Search API key. Without it, search uses DuckDuckGo.
+      const key = z.string().trim().max(500).parse(payload)
+      store.setSecret('web:brave', key); store.save(); return
     }
     case 'settings:workspace': {
       const result = await dialog.showOpenDialog(mainWindow!, { title: 'Choose your Roblox project folder', properties: ['openDirectory'] })

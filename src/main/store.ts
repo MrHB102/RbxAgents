@@ -39,6 +39,7 @@ export class Store {
     for (const provider of this.state.providers) {
       provider.hasKey = !!this.secret(`provider:${provider.id}`)
       provider.status = 'disconnected'
+      delete provider.loginUrl
     }
   }
   get secure() { return this.codec.available() }
@@ -74,6 +75,6 @@ export class Store {
     return result
   }
   snapshot(version: string): RuntimeState {
-    return structuredClone({ ...this.state, approvals: this.approvals, secureStorage: this.secure, platform: process.platform, appVersion: version })
+    return structuredClone({ ...this.state, approvals: this.approvals, secureStorage: this.secure, platform: process.platform, appVersion: version, webSearchKey: !!this.secret('web:brave') })
   }
 }

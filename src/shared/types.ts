@@ -1,8 +1,10 @@
-export type ProviderKind = 'openai' | 'anthropic' | 'chatgpt'
+export type ProviderKind = 'openai' | 'anthropic' | 'chatgpt' | 'claude-code'
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export interface Provider {
   id: string; name: string; kind: ProviderKind; baseUrl: string; models: string[]
   status: 'disconnected' | 'connected' | 'error'; error?: string; hasKey: boolean; account?: string
+  /** Sign-in page printed by Claude Code while a sign-in is waiting. Never saved. */
+  loginUrl?: string
 }
 export interface Agent {
   id: string; name: string; role: string; description: string; color: string; providerId: string
@@ -12,6 +14,8 @@ export interface Agent {
   effort?: Effort
   /** A Master Agent plans and delegates to the other agents instead of working directly. */
   orchestrator?: boolean
+  /** Can search the web and read public pages. On unless set to false. Orchestrators delegate research instead. */
+  web?: boolean
 }
 export interface Skill { id: string; name: string; description: string; category: string; source: string; path: string; builtin: boolean }
 export interface McpServer {
@@ -53,7 +57,7 @@ export interface AppState {
   /** Bumped when bundled defaults change so older workspaces are upgraded once. */
   schema?: number
 }
-export interface RuntimeState extends AppState { approvals: Approval[]; secureStorage: boolean; platform: string; appVersion: string }
+export interface RuntimeState extends AppState { approvals: Approval[]; secureStorage: boolean; platform: string; appVersion: string; /** A Brave Search API key is saved (otherwise web search uses DuckDuckGo). */ webSearchKey: boolean }
 export interface Bridge {
   invoke<T = unknown>(action: string, payload?: unknown): Promise<T>
   onState(callback: (state: RuntimeState) => void): () => void

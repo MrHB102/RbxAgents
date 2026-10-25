@@ -21,6 +21,8 @@ What changed:
 - **Context limit 48,000 characters** (was 36,000) because the memory block now lives inside it. The extra room is paid for by sending far less history.
 - **Effort-aware output caps.** Reasoning consumes output tokens, so `/effort medium|high|xhigh|max` raises the per-request cap to 8,192 / 12,000 / 24,000. The per-message token budget still applies.
 - **Messages sent while an agent works** are delivered at the next step rather than starting a second run, and `/btw` answers from memory without adding to the agent's context.
+- **Web pages are paged like skills.** `web_fetch` returns up to 5,000 characters at a time (6,000 with metadata) and continues at `nextOffset`; a page is downloaded once per message however many pages of it are read, and links back to the same page are dropped from the text. A message is limited to 40 web requests.
+- **Claude Code connections** report usage from Claude Code's final result (input including cache reads and writes, plus output). The token budget is checked after each model request Claude Code makes and stops it when exceeded; a subscription is not billed per token, but the budget still bounds how fast a message uses it.
 - **Master Agent.** Reading and doing happens in worker threads on cheaper models; the Master sees only distilled reports. See [MASTER_AGENT.md](MASTER_AGENT.md).
 
 ## Regression coverage

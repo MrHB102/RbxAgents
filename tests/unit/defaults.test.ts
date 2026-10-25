@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { GLOBAL_PROMPT, LEGACY_AGENT_PROMPTS, LEGACY_GLOBAL_PROMPT, SCHEMA, initialState, migrate } from '../../src/shared/defaults'
+import { createHash } from 'node:crypto'
+import { GLOBAL_PROMPT, GLOBAL_PROMPT_V2, LEGACY_AGENT_PROMPTS, LEGACY_GLOBAL_PROMPT, SCHEMA, initialState, migrate } from '../../src/shared/defaults'
 import { parseCommand, parseEffort } from '../../src/shared/commands'
 import { Store } from '../../src/main/store'
 import { resolveModel } from '../../src/main/runtime'
@@ -26,6 +27,19 @@ describe('workspace upgrade', () => {
     state.agents = state.agents.filter(a => a.id !== 'master')
     migrate(state)
     expect(state.agents.some(a => a.id === 'master')).toBe(false)
+  })
+  it('upgrades the untouched schema 2 workspace prompt to the one with web rules, and keeps edits', () => {
+    // Guards the derived text: it must stay byte-identical to what 0.2.0 shipped before web access.
+    expect(createHash('sha256').update(GLOBAL_PROMPT_V2).digest('hex')).toBe('e436a9155527c1c60e67746677693e5e5f1275b6d10a9a07b0c5ddd33c7e911b')
+    expect(GLOBAL_PROMPT).toContain('web_fetch')
+    const state = initialState('host'); state.schema = 2; state.settings.globalPrompt = GLOBAL_PROMPT_V2
+    const master = state.agents.find(a => a.id === 'master')!; state.agents = state.agents.filter(a => a.id !== 'master')
+    migrate(state)
+    expect(state.settings.globalPrompt).toBe(GLOBAL_PROMPT)
+    expect(state.agents.some(a => a.id === master.id)).toBe(false)
+    const edited = initialState('host'); edited.schema = 2; edited.settings.globalPrompt = `${GLOBAL_PROMPT_V2}\nMy rule.`
+    migrate(edited)
+    expect(edited.settings.globalPrompt).toBe(`${GLOBAL_PROMPT_V2}\nMy rule.`)
   })
   it('does not overwrite a customized workspace prompt', () => {
     const state = initialState('host'); state.schema = 1; state.settings.globalPrompt = 'Custom rules'

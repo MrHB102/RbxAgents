@@ -13,7 +13,7 @@ export function roster(state: Pick<AppState, 'agents' | 'providers'>, exclude: s
   return state.agents.filter(a => a.id !== exclude && !a.orchestrator).map(a => ({
     id: a.id, name: a.name, role: a.role, description: clip(a.description, 160),
     access: a.permission, ready: a.enabled && !!a.model.trim() && state.providers.some(p => p.id === a.providerId),
-    model: a.model || undefined, skills: a.skillIds.map(id => id.replace(/^roblox-/, '')), studio_tools: a.mcpIds.length > 0
+    model: a.model || undefined, skills: a.skillIds.map(id => id.replace(/^roblox-/, '')), studio_tools: a.mcpIds.length > 0, web: a.web !== false
   }))
 }
 
