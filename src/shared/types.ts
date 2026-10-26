@@ -22,11 +22,15 @@ export interface McpServer {
   id: string; name: string; transport: 'bundled' | 'stdio' | 'http' | 'sse'; command: string
   args: string[]; url: string; env: Record<string, string>; status: 'disconnected' | 'connecting' | 'connected' | 'error'
   error?: string; tools: McpTool[]; pluginDirectory: string; installed: boolean
+  /** Blender only: a Blender executable or install folder, when it is not in a standard place. */
+  blenderPath?: string
 }
 export interface McpTool { name: string; description: string; inputSchema: Record<string, unknown>; readOnly: boolean }
+/** A rendered preview or image an agent shared in the chat. The file lives in the app's media folder, never in the saved workspace. */
+export interface MediaItem { id: string; kind: 'video' | 'image'; mime: string; name: string; bytes: number; caption?: string }
 /** `queued` = sent while the agent was working, not delivered yet. `btw`/`command` never enter the model context. */
 export type MessageKind = 'queued' | 'btw' | 'command'
-export interface Message { id: string; role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt: string; kind?: MessageKind; agentId?: string }
+export interface Message { id: string; role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt: string; kind?: MessageKind; agentId?: string; media?: MediaItem[] }
 export interface ThreadUsage { id: string; agentId: string; agentName: string; model: string; tokens: number; requests: number; status: 'running' | 'done' | 'error' }
 export interface RunUsage { tokens: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; requests: number; contextCharacters: number; estimated: boolean; threads?: ThreadUsage[] }
 /** A skill page the agent already read. Kept across messages so it is never fetched (or paid for) twice. */

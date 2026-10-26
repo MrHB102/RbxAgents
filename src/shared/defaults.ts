@@ -1,6 +1,14 @@
-import type { Agent, AppState } from './types'
+import type { Agent, AppState, McpServer } from './types'
 
-export const SCHEMA = 4
+export const SCHEMA = 5
+
+export const BLENDER_ID = 'blender'
+/** The Blender MCP server is pinned: the add-on it installs and the server that talks to it are always the same release. */
+export const BLENDER_PACKAGE = 'mcp-for-blender@2.2.4'
+export const BLENDER_REPOSITORY = 'https://github.com/ahujasid/mcp-for-blender'
+export function blenderServer(): McpServer {
+  return { id: BLENDER_ID, name: 'Blender', transport: 'stdio', command: 'uvx', args: [BLENDER_PACKAGE], url: '', env: { DISABLE_TELEMETRY: 'true' }, status: 'disconnected', tools: [], pluginDirectory: '', installed: false }
+}
 
 const WEB_RULES = `# Web
 web_search and web_fetch read the public internet. Use them for current Roblox documentation, API changes, DevForum answers, and library docs, not for what the project or Studio already shows you. Search, then read the best one or two results; do not crawl.
@@ -103,7 +111,19 @@ export function defaultAgents(): Agent[] {
     id: name.toLowerCase(), name, role: agentRole, description, color, systemPrompt, skillIds: ['roblox-collaboration-mode', ...skills],
     providerId: '', model: '', mcpIds: ['roblox'], enabled: true, permission: name === 'Reviewer' ? 'read-only' : 'ask'
   }))
-  return [masterAgent(), ...workers]
+  return [masterAgent(), ...workers, blenderAgent()]
+}
+export const BLENDER_PROMPT = `You are a 3D artist and animator working in Blender through the Blender MCP tools. You model, rig, and animate, often for Roblox games (R6 and R15 rigs, low-poly meshes, textures, glTF or FBX exports).
+
+Inspect before you change anything: get_scene_info for what exists, look to see it. Never assume object, bone, or collection names. Work in small steps, verify each significant change with look or render_preview, and report what you actually saw.
+Show results instead of describing them: render_preview sends a playable preview straight into this chat (turntable for a model, animation for motion, still for a single frame). Keep previews short and low resolution while iterating, and render a larger one when the user approves the direction.
+execute_blender_code runs Python in the user's open Blender session. Return structured data from it, keep each call focused, and never delete or overwrite the user's work, files, or datablocks unless asked. If a script could lose work, tell the user to save the .blend first.
+When the model or animation is meant for Roblox, check the rig, scale, and export format the target expects before you finish, and say what the user still has to do in Studio.`
+export function blenderAgent(): Agent {
+  return {
+    id: 'artist', name: 'Artist', role: '3D & animation', description: 'Models, rigs, and animates in Blender, then sends you rendered previews right in the chat.',
+    color: '#8be9fd', systemPrompt: BLENDER_PROMPT, skillIds: [], providerId: '', model: '', mcpIds: [BLENDER_ID], enabled: true, permission: 'ask'
+  }
 }
 export function masterAgent(): Agent {
   return {
@@ -116,7 +136,7 @@ export function initialState(hostId: string): AppState {
   return {
     version: 1, schema: SCHEMA, hostId, agents: defaultAgents(), skills: [], sessions: [], activity: [],
     providers: [],
-    servers: [{ id: 'roblox', name: 'Roblox Studio', transport: 'bundled', command: '', args: [], url: '', env: {}, status: 'disconnected', tools: [], pluginDirectory: '', installed: false }],
+    servers: [{ id: 'roblox', name: 'Roblox Studio', transport: 'bundled', command: '', args: [], url: '', env: {}, status: 'disconnected', tools: [], pluginDirectory: '', installed: false }, blenderServer()],
     settings: { workspace: '', globalPrompt: GLOBAL_PROMPT, maxConcurrent: 3 }
   }
 }
@@ -134,6 +154,11 @@ export function migrate(state: AppState) {
       if (legacy && next && agent.systemPrompt === legacy) agent.systemPrompt = next.systemPrompt
     }
     if (!state.agents.some(a => a.orchestrator || a.id === 'master')) state.agents.unshift(masterAgent())
+  }
+  // Schema 5 adds the Blender connection and the Artist agent. Neither replaces anything the user already has.
+  if (from < 5) {
+    if (!state.servers.some(s => s.id === BLENDER_ID)) state.servers.push(blenderServer())
+    if (!state.agents.some(a => a.id === 'artist')) state.agents.push(blenderAgent())
   }
   // Step limits and token budgets were removed in schema 4; saved values would only confuse an export.
   for (const agent of state.agents) { delete (agent as { maxSteps?: number }).maxSteps; delete (agent as { tokenBudget?: number }).tokenBudget }

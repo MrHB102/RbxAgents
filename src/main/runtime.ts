@@ -1,12 +1,16 @@
 import { randomUUID } from 'node:crypto'
-import type { Agent, Approval, Effort, McpServer, Message, PlanStep, Provider, RunUsage, Session, Skill, ThreadUsage } from '../shared/types'
+import { extname } from 'node:path'
+import type { Agent, Approval, Effort, MediaItem, McpServer, Message, PlanStep, Provider, RunUsage, Session, Skill, ThreadUsage } from '../shared/types'
 import { SLASH_COMMANDS, parseCommand, parseEffort } from '../shared/commands'
+import { BLENDER_ID } from '../shared/defaults'
 import type { Store } from './store'
 import type { Providers, ToolSpec, Turn } from './providers'
 import type { McpManager } from './mcp'
 import { readSkill } from './skills'
 import { instructions, roster } from './prompts'
 import { realWeb, webPage, type WebTools } from './web'
+import { parsePreview, previewOptions, previewScript } from './blender'
+import { SHAREABLE, type MediaStore } from './media'
 import { boundedText, clip, compactTurns, findTools, foldAll, foldHistory, historyTurns, memoryBlock, memoryOf, outputCap, pinPage, skillPageParts, toolResultText, CONTEXT_CHARACTERS } from './context'
 
 const PALETTE = ['#bd93f9', '#50fa7b', '#8be9fd', '#ffb86c', '#ff79c6', '#f1fa8c']
@@ -53,7 +57,7 @@ export class AgentRuntime {
   private runs = new Map<string, Run>()
   private sideRuns = new Map<string, Set<AbortController>>()
   private decisions = new Map<string, (allow: boolean) => void>()
-  constructor(private store: Store, private providers: Providers, private mcp: McpManager, private web: WebTools = realWeb) {}
+  constructor(private store: Store, private providers: Providers, private mcp: McpManager, private web: WebTools = realWeb, private media?: MediaStore) {}
 
   // ---- Entry points -------------------------------------------------------------------------------------------
 
@@ -152,6 +156,8 @@ export class AgentRuntime {
       { name: 'search_tools', description: 'Find relevant MCP tools and their argument schemas. Search specific actions, for example connected instances, read script, or execute_luau.', parameters: { type: 'object', properties: { query: { type: 'string', maxLength: 200 }, limit: { type: 'integer', minimum: 1, maximum: 5 } }, required: ['query'], additionalProperties: false } },
       { name: 'call_tool', description: 'Execute a tool discovered with search_tools. Use its exact server_id, tool name, and arguments. Access mode is enforced by the application.', parameters: { type: 'object', properties: { server_id: { type: 'string', enum: servers.map(s => s.id) }, name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['server_id', 'name', 'arguments'], additionalProperties: false } }
     )
+    // Agents with the Blender connection can put renders and images in the chat.
+    if (this.media && servers.some(s => s.id === BLENDER_ID)) tools.push(...this.mediaToolSpecs())
     if (agent.orchestrator) tools.push(...this.masterTools())
     // Orchestrators delegate research; their workers read the web.
     else if (agent.web !== false) tools.push(...this.webToolSpecs())
@@ -188,9 +194,9 @@ export class AgentRuntime {
       // Claude Code runs the whole tool loop itself and calls back here for each tool, so rows keep their order in the transcript.
       const execute = p.native ? async (name: string, args: Record<string, unknown>) => {
         close()
-        const { output, label } = await this.runTool(run, p, { id: randomUUID(), name, arguments: JSON.stringify(args) })
+        const { output, label, media } = await this.runTool(run, p, { id: randomUUID(), name, arguments: JSON.stringify(args) })
         const bounded = boundedText(output)
-        session.messages.push({ id: randomUUID(), role: 'tool', content: `${label}\n${this.store.redact(bounded)}`, createdAt: new Date().toISOString(), ...(p.primary ? {} : { agentId: p.agent.id }) })
+        session.messages.push({ id: randomUUID(), role: 'tool', content: `${label}\n${this.store.redact(bounded)}`, createdAt: new Date().toISOString(), ...(p.primary ? {} : { agentId: p.agent.id }), ...(media ? { media } : {}) })
         this.store.save()
         const update = p.primary ? this.takeQueue(run) : ''
         return update ? `${bounded}\n\n${update}` : bounded
@@ -222,10 +228,10 @@ export class AgentRuntime {
       const outputs = delegations ? await Promise.all(response.calls.map(c => this.runTool(run, p, c))) : undefined
       for (const [index, call] of response.calls.entries()) {
         signal.throwIfAborted()
-        const { output, label } = outputs ? outputs[index] : await this.runTool(run, p, call)
+        const { output, label, media } = outputs ? outputs[index] : await this.runTool(run, p, call)
         const bounded = boundedText(output)
         p.turns.push({ role: 'tool', content: bounded, tool_call_id: call.id })
-        session.messages.push({ id: randomUUID(), role: 'tool', content: `${label}\n${this.store.redact(bounded)}`, createdAt: new Date().toISOString(), ...(p.primary ? {} : { agentId: p.agent.id }) })
+        session.messages.push({ id: randomUUID(), role: 'tool', content: `${label}\n${this.store.redact(bounded)}`, createdAt: new Date().toISOString(), ...(p.primary ? {} : { agentId: p.agent.id }), ...(media ? { media } : {}) })
         this.store.save()
       }
     }
@@ -256,10 +262,11 @@ export class AgentRuntime {
     return who.primary ? detail.trim() : `${who.agent.name} · ${detail.trim()}`
   }
 
-  private async runTool(run: Run, p: Participant, call: { id: string; name: string; arguments: string }): Promise<{ output: string; label: string }> {
+  private async runTool(run: Run, p: Participant, call: { id: string; name: string; arguments: string }): Promise<{ output: string; label: string; media?: MediaItem[] }> {
     const { signal } = run
     let args: Record<string, any> = {}
     let output: string
+    let media: MediaItem[] | undefined
     try {
       try { args = JSON.parse(call.arguments) } catch { throw new Error('Tool arguments must be valid JSON.') }
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Tool arguments must be a JSON object.')
@@ -269,13 +276,14 @@ export class AgentRuntime {
         output = JSON.stringify(findTools(p.servers, args.query, p.agent.permission === 'read-only', Number.isSafeInteger(args.limit) ? args.limit : 3))
       } else if (call.name === 'call_tool') output = await this.callTool(run, p, args)
       else if ((call.name === 'web_search' || call.name === 'web_fetch') && p.tools.some(t => t.name === call.name)) output = await this.webTool(run, p, call.name, args)
+      else if ((call.name === 'render_preview' || call.name === 'share_media') && p.tools.some(t => t.name === call.name)) { const shared = await this.mediaTool(run, p, call.name, args); output = shared.output; media = shared.media }
       else if (p.agent.orchestrator && ['delegate', 'send_to_agent', 'create_agent', 'update_plan', 'list_agents'].includes(call.name)) output = await this.masterTool(run, p, call.name, args)
       else throw new Error('The model requested an unavailable tool.')
     } catch (e) {
       if (signal.aborted) throw e
       output = JSON.stringify({ error: this.store.redact(error(e)) })
     }
-    return { output, label: this.label(call.name, args, p) }
+    return { output, label: this.label(call.name, args, p), ...(media ? { media } : {}) }
   }
 
   private loadSkill(run: Run, p: Participant, args: Record<string, any>) {
@@ -304,24 +312,71 @@ export class AgentRuntime {
     if (!server || !tool) throw new Error('The model requested an unavailable tool.')
     const toolArgs = args.arguments
     if (!toolArgs || typeof toolArgs !== 'object' || Array.isArray(toolArgs)) throw new Error('Tool arguments must be an object.')
-    if (!tool.readOnly) {
-      if (agent.permission === 'read-only') throw new Error('This agent only has read access.')
-      if (agent.permission !== 'unrestricted') {
-        const approved = await this.approve({ id: randomUUID(), sessionId: session.id, agentId: agent.id, serverId: server.id, tool: tool.name, args: toolArgs, kind: 'tool' }, signal)
-        if (!approved) throw new Error('The user denied this tool call. Respect the decision and do not retry it.')
-      }
-    }
-    signal.throwIfAborted()
-    if (!tool.readOnly && agent.permission === 'read-only') throw new Error('This agent only has read access.')
+    await this.gate(run, p, server.id, tool.name, toolArgs, tool.readOnly)
     session.status = 'running'; this.store.save()
-    const accessAtDispatch = agent.permission
-    const result = await this.mcp.call(server.id, tool.name, toolArgs, signal, () => {
-      if (!tool.readOnly && agent.permission === 'read-only') throw new Error('This agent only has read access.')
-      if (!tool.readOnly && accessAtDispatch === 'unrestricted' && agent.permission === 'ask') throw new Error('The access mode changed before this queued action ran. Request the tool again to obtain approval.')
-    })
+    const result = await this.mcp.call(server.id, tool.name, toolArgs, signal, this.dispatchGuard(agent, tool.readOnly))
     const output = toolResultText(result)
     this.store.log('tool', `${agent.name} · ${tool.name}`, output.slice(0, 1000), agent.id)
     return output
+  }
+
+  /** Access mode check for anything that changes something: refuses read-only agents and waits for approval in Ask mode. */
+  private async gate(run: Run, p: Participant, serverId: string, tool: string, args: Record<string, unknown>, readOnly: boolean) {
+    const agent = p.agent
+    if (!readOnly) {
+      if (agent.permission === 'read-only') throw new Error('This agent only has read access.')
+      if (agent.permission !== 'unrestricted') {
+        const approved = await this.approve({ id: randomUUID(), sessionId: run.session.id, agentId: agent.id, serverId, tool, args, kind: 'tool' }, run.signal)
+        if (!approved) throw new Error('The user denied this tool call. Respect the decision and do not retry it.')
+      }
+    }
+    run.signal.throwIfAborted()
+    if (!readOnly && agent.permission === 'read-only') throw new Error('This agent only has read access.')
+  }
+  /** Runs right before a queued call is sent: the access mode may have changed while it waited. */
+  private dispatchGuard(agent: Agent, readOnly: boolean) {
+    const access = agent.permission
+    return () => {
+      if (!readOnly && agent.permission === 'read-only') throw new Error('This agent only has read access.')
+      if (!readOnly && access === 'unrestricted' && agent.permission === 'ask') throw new Error('The access mode changed before this queued action ran. Request the tool again to obtain approval.')
+    }
+  }
+
+  // ---- Previews in the chat -----------------------------------------------------------------------------------
+
+  private mediaToolSpecs(): ToolSpec[] {
+    const enumeration = (values: string[]) => ({ type: 'string', enum: values })
+    return [
+      { name: 'render_preview', description: "Render a short preview in the user's open Blender and post it in the chat as a playable video (an image for a still). turntable orbits the model once, animation plays the scene's own animation from its first frame, still renders one frame. It frames everything visible (focus 'selected' frames only the selection), uses temporary settings and a temporary camera and light when the scene has none, and puts everything back. Blender is busy while it renders, so keep frames and height small while iterating. Needs approval in Ask mode.", parameters: { type: 'object', properties: { mode: enumeration(['turntable', 'animation', 'still']), frames: { type: 'integer', minimum: 8, maximum: 240 }, height: { type: 'integer', minimum: 240, maximum: 1080 }, engine: enumeration(['eevee', 'workbench', 'scene']), format: enumeration(['mp4', 'webm']), focus: enumeration(['all', 'selected']), caption: { type: 'string', maxLength: 300 } }, additionalProperties: false } },
+      { name: 'share_media', description: `Show an image or video that already exists on this computer in the chat (${SHAREABLE}), for example a render you saved yourself. It is copied into the app and shown to the user; it is not sent anywhere else.`, parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 1000 }, caption: { type: 'string', maxLength: 300 } }, required: ['path'], additionalProperties: false } }
+    ]
+  }
+
+  private async mediaTool(run: Run, p: Participant, name: string, args: Record<string, any>): Promise<{ output: string; media: MediaItem[] }> {
+    const media = this.media
+    if (!media) throw new Error('Sharing previews is not available.')
+    const caption = typeof args.caption === 'string' ? args.caption : undefined
+    const summary = (item: MediaItem) => ({ shared: true, kind: item.kind, name: item.name, megabytes: Math.round(item.bytes / 1e5) / 10, note: 'The user can now see it in the chat. Describe what it shows only from what you know about the scene.' })
+    if (name === 'share_media') {
+      if (typeof args.path !== 'string') throw new Error('Give the full path of the file to share.')
+      const item = media.ingest(args.path, { caption })
+      this.store.log('tool', `${p.agent.name} · share_media`, `${item.name}, ${item.bytes} bytes`, p.agent.id)
+      return { output: JSON.stringify(summary(item)), media: [item] }
+    }
+    await this.gate(run, p, BLENDER_ID, 'render_preview', args, false)
+    const directory = media.scratch()
+    try {
+      const options = previewOptions(args, directory)
+      run.session.status = 'running'; this.store.save()
+      // Rendering is slow and Blender cannot be interrupted from here, so this call waits up to ten minutes.
+      const result = await this.mcp.call(BLENDER_ID, 'execute_blender_code', { code: previewScript(options) }, run.signal, this.dispatchGuard(p.agent, false), 600_000)
+      const text = (Array.isArray(result.content) ? result.content : []).map((part: { type?: string; text?: string }) => part.type === 'text' ? part.text : '').filter(Boolean).join('\n')
+      const preview = parsePreview(text)
+      if (result.isError || !preview?.file) throw new Error(`Blender did not produce a preview. ${clip(text || 'No output.', 500)}`)
+      const item = media.ingest(preview.file, { caption, name: `${options.mode}-${preview.height}p${extname(preview.file)}` })
+      this.store.log('tool', `${p.agent.name} · render_preview`, `${options.mode} ${preview.width}x${preview.height}, ${preview.frames} frames, ${preview.engine}`, p.agent.id)
+      return { output: JSON.stringify({ ...summary(item), mode: options.mode, width: preview.width, height: preview.height, frames: preview.frames, engine: preview.engine }), media: [item] }
+    } finally { media.discard(directory) }
   }
 
   // ---- Web access ---------------------------------------------------------------------------------------------

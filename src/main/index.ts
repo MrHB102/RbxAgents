@@ -1,8 +1,8 @@
-import { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, protocol, safeStorage, shell, Menu } from 'electron'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { z } from 'zod'
 import { Store } from './store'
 import { scanSkills, readSkill, importSkillFolder } from './skills'
@@ -12,6 +12,8 @@ import { McpManager } from './mcp'
 import { AgentRuntime } from './runtime'
 import { validateEndpoint } from './http'
 import { CLAUDE_CODE_MODELS } from './claudecode'
+import { MEDIA_SCHEME, MediaStore } from './media'
+import { BLENDER_ID, BLENDER_REPOSITORY } from '../shared/defaults'
 import { EFFORTS } from '../shared/commands'
 import type { Agent, McpServer, Provider } from '../shared/types'
 
@@ -23,7 +25,7 @@ const agentSchema = z.object({
   effort: z.enum(EFFORTS).optional(), orchestrator: z.boolean().optional(), web: z.boolean().optional()
 })
 const providerSchema = z.object({ id, name: short, kind: z.enum(['openai', 'anthropic', 'chatgpt', 'claude-code']), baseUrl: z.string().max(2000), apiKey: z.string().max(20_000).optional(), models: z.array(z.string().max(200)).max(1000).default([]) })
-const serverSchema = z.object({ id, name: short, transport: z.enum(['bundled', 'stdio', 'http', 'sse']), command: z.string().max(4000), args: z.array(z.string().max(4000)).max(100), url: z.string().max(2000), env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string().max(4000)), pluginDirectory: z.string().max(4000), token: z.string().max(20_000).optional() })
+const serverSchema = z.object({ id, name: short, transport: z.enum(['bundled', 'stdio', 'http', 'sse']), command: z.string().max(4000), args: z.array(z.string().max(4000)).max(100), url: z.string().max(2000), env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string().max(4000)), pluginDirectory: z.string().max(4000), blenderPath: z.string().max(4000).optional(), token: z.string().max(20_000).optional() })
 
 let mainWindow: BrowserWindow | null = null
 let store: Store
@@ -31,6 +33,7 @@ let auth: ChatGPTAuth
 let providers: Providers
 let mcp: McpManager
 let runtime: AgentRuntime
+let media: MediaStore
 let quitting = false
 const claudeLogins = new Map<string, AbortController>()
 const rendererFile = join(import.meta.dirname, '../renderer/index.html')
@@ -38,6 +41,8 @@ const devUrl = !app.isPackaged ? process.env.ELECTRON_RENDERER_URL : undefined
 const testDirectory = !app.isPackaged ? process.env.RBX_AGENTS_TEST_DATA : undefined
 if (testDirectory) app.setPath('userData', testDirectory)
 if (!app.requestSingleInstanceLock()) app.quit()
+// Rendered previews in the chat load from this scheme. It must be declared before the app is ready.
+protocol.registerSchemesAsPrivileged([{ scheme: MEDIA_SCHEME, privileges: { standard: true, secure: true, stream: true, supportFetchAPI: true } }])
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -52,6 +57,11 @@ function createWindow() {
   mainWindow.on('closed', () => { mainWindow = null })
   if (devUrl) void mainWindow.loadURL(devUrl)
   else void mainWindow.loadFile(rendererFile)
+}
+
+/** Deletes preview files that no conversation refers to any more. */
+function pruneMedia(options: { incoming?: boolean } = {}) {
+  media.prune(new Set(store.state.sessions.flatMap(s => s.messages.flatMap(m => (m.media || []).map(item => item.id)))), options)
 }
 
 function requireIdleProvider(providerId: string) {
@@ -152,6 +162,7 @@ async function action(name: string, payload: unknown): Promise<unknown> {
       if (store.state.sessions.some(s => runtime.isRunning(s.id) && store.state.agents.find(a => a.id === s.agentId)?.mcpIds.includes(data.id))) throw new Error('Stop the agents using this bridge before changing it.')
       if (data.transport === 'bundled' && data.id !== 'roblox') throw new Error('The bundled bridge uses the reserved Roblox connection.')
       if (data.id === 'roblox' && data.transport !== 'bundled') throw new Error('The built-in Roblox bridge must use the bundled transport.')
+      if (data.id === BLENDER_ID && data.transport !== 'stdio') throw new Error('The Blender connection runs as a local process.')
       if (data.transport === 'http' || data.transport === 'sse') data.url = validateEndpoint(data.url)
       if (existing) await mcp.disconnect(data.id)
       if (data.token !== undefined) store.setSecret(`mcp:${data.id}`, data.token)
@@ -169,6 +180,23 @@ async function action(name: string, payload: unknown): Promise<unknown> {
       await mcp.disconnect(serverId); return
     }
     case 'mcp:instances': return mcp.call('roblox', 'get_connected_instances', {})
+    case 'mcp:blender': return mcp.blenderStatus()
+    case 'mcp:blender-path': {
+      const result = await dialog.showOpenDialog(mainWindow!, { title: 'Choose your Blender program', properties: process.platform === 'darwin' ? ['openDirectory'] : ['openFile'], ...(process.platform === 'win32' ? { filters: [{ name: 'Blender', extensions: ['exe'] }] } : {}) })
+      return result.canceled ? null : result.filePaths[0]
+    }
+    case 'media:save': {
+      const found = media.locate(z.string().max(100).parse(payload))
+      if (!found) throw new Error('This preview is no longer available.')
+      const result = await dialog.showSaveDialog(mainWindow!, { title: 'Save preview', defaultPath: `blender-preview${found.path.slice(found.path.lastIndexOf('.'))}` })
+      if (result.canceled || !result.filePath) return false
+      copyFileSync(found.path, result.filePath); return true
+    }
+    case 'media:reveal': {
+      const found = media.locate(z.string().max(100).parse(payload))
+      if (!found) throw new Error('This preview is no longer available.')
+      shell.showItemInFolder(found.path); return
+    }
     case 'mcp:directory': {
       const result = await dialog.showOpenDialog(mainWindow!, { title: 'Choose the Roblox Studio Plugins folder', properties: ['openDirectory', 'createDirectory'] })
       return result.canceled ? null : result.filePaths[0]
@@ -195,7 +223,7 @@ async function action(name: string, payload: unknown): Promise<unknown> {
     case 'session:delete': {
       const sessionId = id.parse(payload)
       if (runtime.isRunning(sessionId)) throw new Error('Stop this conversation before deleting it.')
-      store.state.sessions = store.state.sessions.filter(s => s.id !== sessionId); store.save(); return
+      store.state.sessions = store.state.sessions.filter(s => s.id !== sessionId); store.save(); pruneMedia(); return
     }
     case 'session:send': {
       const data = z.object({ id, content: z.string().trim().min(1).max(100_000) }).parse(payload)
@@ -236,7 +264,7 @@ async function action(name: string, payload: unknown): Promise<unknown> {
     }
     case 'external:open': {
       const url = z.string().url().parse(payload)
-      const allowed = ['https://github.com/tabooharmony/roblox-brain', 'https://github.com/Chrrxs/robloxstudio-mcp', 'https://chatgpt.com/settings/usage', 'https://platform.openai.com/api-keys', 'https://console.anthropic.com', 'https://code.claude.com/docs/en/legal-and-compliance']
+      const allowed = ['https://github.com/tabooharmony/roblox-brain', 'https://github.com/Chrrxs/robloxstudio-mcp', 'https://chatgpt.com/settings/usage', 'https://platform.openai.com/api-keys', 'https://console.anthropic.com', 'https://code.claude.com/docs/en/legal-and-compliance', BLENDER_REPOSITORY, 'https://docs.astral.sh/uv/']
       if (!allowed.includes(url)) throw new Error('This external link is not allowed.')
       await shell.openExternal(url); return
     }
@@ -254,7 +282,15 @@ app.whenReady().then(() => {
   store.state.skills = [...scanSkills(join(resourceRoot, 'roblox-brain', 'skills'), true, 'TabooHarmony/roblox-brain'), ...scanSkills(join(app.getPath('userData'), 'skills'), false, 'Local import')]
   mkdirSync(join(app.getPath('userData'), 'skills'), { recursive: true })
   auth = new ChatGPTAuth(store, url => shell.openExternal(url))
-  providers = new Providers(store, auth); mcp = new McpManager(store); runtime = new AgentRuntime(store, providers, mcp)
+  media = new MediaStore(join(app.getPath('userData'), 'media'))
+  pruneMedia({ incoming: true })
+  protocol.handle(MEDIA_SCHEME, request => media.serve(request.url, request.headers.get('range')))
+  // Installing software is the user's call: this is the only place the app asks before running someone else's installer.
+  const confirm = (detail: string) => {
+    const options = { type: 'question' as const, buttons: ['Install', 'Cancel'], defaultId: 0, cancelId: 1, title: 'Install uv?', message: 'Install uv to connect Blender?', detail }
+    return (mainWindow ? dialog.showMessageBox(mainWindow, options) : dialog.showMessageBox(options)).then(result => result.response === 0)
+  }
+  providers = new Providers(store, auth); mcp = new McpManager(store, { confirm }); runtime = new AgentRuntime(store, providers, mcp, undefined, media)
   store.subscribe(() => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rbx:state', store.snapshot(app.getVersion())) })
   ipcMain.handle('rbx:action', async (event, name: unknown, payload: unknown) => {
     const sender = event.senderFrame

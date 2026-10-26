@@ -16,7 +16,14 @@ try {
   const snapshot = await page.evaluate(() => window.rbx.invoke('state'))
   assert.equal(snapshot.appVersion, JSON.parse(readFileSync('package.json', 'utf8')).version)
   assert.equal(snapshot.skills.filter(skill => skill.builtin).length, 29)
-  assert.equal(snapshot.agents.length, 5)
+  assert.equal(snapshot.agents.length, 6)
+  const blender = snapshot.servers.find(server => server.id === 'blender')
+  assert.equal(blender.transport, 'stdio')
+  assert.match(blender.args[0], /^mcp-for-blender@\d+\.\d+\.\d+$/)
+  assert.equal(blender.env.DISABLE_TELEMETRY, 'true')
+  assert.ok(snapshot.agents.some(agent => agent.id === 'artist' && agent.mcpIds.includes('blender')))
+  // The preview scheme is registered in the packaged app (the page itself loads previews with <video> and <img>; its CSP blocks fetch).
+  assert.equal(await desktop.evaluate(({ protocol }) => protocol.isProtocolHandled('rbx-media')), true)
   const agent = await page.evaluate(config => window.rbx.invoke('agent:save', config), { ...snapshot.agents[0], permission: 'unrestricted' })
   assert.equal(agent.permission, 'unrestricted')
   assert.equal('tokenBudget' in agent, false)
@@ -30,5 +37,5 @@ try {
   const plugins = readdirSync(pluginDirectory).filter(name => name.endsWith('.rbxmx'))
   assert.equal(plugins.length, 1)
   assert.ok(statSync(join(pluginDirectory, plugins[0])).size > 1_000_000)
-  console.log('Packaged application verified: isolated profile, renderer, 29 skills, Unrestricted access, no per-message limits, and bundled plugin installer.')
+  console.log('Packaged application verified: isolated profile, renderer, 29 skills, Unrestricted access, no per-message limits, Blender connection and Artist agent, preview protocol, and bundled plugin installer.')
 } finally { await desktop.close() }

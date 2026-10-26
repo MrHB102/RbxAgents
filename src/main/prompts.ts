@@ -1,5 +1,5 @@
 import type { Agent, AppState, Skill } from '../shared/types'
-import { WORKER_PROTOCOL } from '../shared/defaults'
+import { BLENDER_ID, WORKER_PROTOCOL } from '../shared/defaults'
 import { clip } from './context'
 
 export function permissionText(agent: Pick<Agent, 'permission'>) {
@@ -13,7 +13,7 @@ export function roster(state: Pick<AppState, 'agents' | 'providers'>, exclude: s
   return state.agents.filter(a => a.id !== exclude && !a.orchestrator).map(a => ({
     id: a.id, name: a.name, role: a.role, description: clip(a.description, 160),
     access: a.permission, ready: a.enabled && !!a.model.trim() && state.providers.some(p => p.id === a.providerId),
-    model: a.model || undefined, skills: a.skillIds.map(id => id.replace(/^roblox-/, '')), studio_tools: a.mcpIds.length > 0, web: a.web !== false
+    model: a.model || undefined, skills: a.skillIds.map(id => id.replace(/^roblox-/, '')), studio_tools: a.mcpIds.length > 0, connections: a.mcpIds, web: a.web !== false
   }))
 }
 
@@ -26,6 +26,7 @@ export function instructions({ global, agent, skills, state, worker }: Instructi
     agent.systemPrompt,
     worker && WORKER_PROTOCOL,
     agent.orchestrator && `# Your team (live from the workspace)\n${JSON.stringify(roster(state, agent.id))}\nWorkers run with their own model, skills, and access mode. Reports reach you as tool results.`,
+    agent.mcpIds.includes(BLENDER_ID) && `# Blender\nBlender is the MCP connection "${BLENDER_ID}"; find its tools with search_tools. render_preview and share_media are tools of their own: they post a playable preview or an image straight into the chat, so show results instead of describing them. Rendering keeps Blender busy, so start small and short.`,
     skills.length && `# Available skills (load only what the task needs with load_skill)\n${catalog}`,
     `# Runtime\nsearch_tools finds an MCP tool and its schema; call_tool runs it. Older context may be shortened to save tokens: the Session memory block keeps what mattered.${agent.mcpIds.length ? ` MCP connections: ${agent.mcpIds.join(', ')}.` : ''}`,
     permissionText(agent)

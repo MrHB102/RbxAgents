@@ -26,6 +26,7 @@ Built with a clean Dracula-inspired interface, a complete Roblox skill library, 
 - **Set their instructions.** Combine a workspace system prompt, individual agent instructions, and selected skills.
 - **Use all 29 Roblox skills offline.** The complete [roblox-brain](https://github.com/tabooharmony/roblox-brain) library ships with the app, including every `references/full.md`. Import additional local skill collections.
 - **Connect directly to Studio.** The [Chrrxs Roblox Studio MCP](https://github.com/Chrrxs/robloxstudio-mcp) server and matching plugin are bundled. Install the plugin from inside the app without a separate Node.js installation.
+- **Model and animate in Blender.** Connect [MCP for Blender](https://github.com/ahujasid/mcp-for-blender) with one click. The **Artist** agent inspects your scene, runs Blender Python (with your approval), and **posts rendered previews straight into the chat**: turntable videos, animation clips, and stills that play right there. See [docs/BLENDER.md](docs/BLENDER.md).
 - **Choose an access mode.** Use Ask before changes, Read only, or **Unrestricted access** to execute tools without approval prompts. Calls to the same MCP server are serialized across agents.
 - **Spend fewer tokens.** Discover MCP tools on demand, load paged skill references, keep bounded context, and remember what was learned between messages.
 - **Keep your context.** Conversations, agent settings, token counts reported by providers, and recent activity are stored locally. Export agent definitions and the workspace prompt without credentials.
@@ -58,11 +59,13 @@ npm run preview
 2. Select **Refresh models**, or use **Continue with ChatGPT** for a ChatGPT connection.
 3. Open an agent’s **Configure** dialog and choose its provider and model.
 4. Select its skills, instructions, permissions, and MCP connections.
-5. Open **Roblox MCP**, select **Install Studio plugin**, then fully close and reopen Roblox Studio.
+5. Open **MCP bridges**, select **Install Studio plugin**, then fully close and reopen Roblox Studio.
 6. Connect the Studio plugin, select **Connect bridge**, and use **Check Studio instances** to inspect availability.
 7. Start a conversation with an agent and give it a task.
 
 A connected MCP bridge does not by itself mean that a Studio place is connected. Agents are instructed to discover the target Studio instance before making changes.
+
+For Blender, open **MCP bridges** and select **Install Blender add-on**, open Blender, then **Connect bridge** and **Check Blender**. Details are in [Blender](#blender).
 
 For a planning-only conversation, turn off the agent’s MCP connections in **Configure → Connections**. This allows the agent to work without Studio running.
 
@@ -185,13 +188,26 @@ my-skill/
 
 The application pins **`@chrrxs/robloxstudio-mcp` 3.3.0**, including its matching `MCPPlugin.rbxmx`. The installer invokes the package’s own `--install-plugin` command using the bundled Electron Node runtime. It does not need to download or execute an unpinned npm package at launch.
 
-The default Windows plugin location is detected by the upstream installer. A custom Plugins folder can be selected in **Roblox MCP → settings**. After installation or replacement, restart Studio completely. The upstream installer may replace its existing plugin or remove the other edition to maintain version compatibility.
+The default Windows plugin location is detected by the upstream installer. A custom Plugins folder can be selected in **MCP bridges → Configure Roblox Studio**. After installation or replacement, restart Studio completely. The upstream installer may replace its existing plugin or remove the other edition to maintain version compatibility.
 
 ### Linux and Wine
 
 RBX Agents runs natively on Linux. Roblox Studio itself requires a compatible Wine setup. Before installing the plugin, select the Studio **Plugins** directory inside your Wine prefix. Where needed, configure the upstream bridge environment using `ROBLOX_STUDIO_WINE_LAUNCHER`, `ROBLOX_STUDIO_EXE`, and related non-secret settings. See the [upstream Linux configuration](https://github.com/Chrrxs/robloxstudio-mcp/blob/main/docs/configuration.md#native-linux-with-wine).
 
 Custom MCP servers support **stdio**, **Streamable HTTP**, and **legacy SSE**. HTTP/SSE connections can store a bearer token in the credential vault. Local server commands run as your OS user; configure executables you trust. The environment editor is for non-secret values and is stored in plain text with the workspace.
+
+## Blender
+
+RBX Agents connects to Blender through [MCP for Blender](https://github.com/ahujasid/mcp-for-blender) (`mcp-for-blender` **2.2.4**, MIT). It is not bundled: the app runs it with [uv](https://docs.astral.sh/uv/) at the pinned version, so the add-on and the server that talks to it are always the same release.
+
+**Install Blender add-on** (in **MCP bridges**) does four things: installs uv if it is missing (it asks first, then runs Astral's official installer), runs `mcp-for-blender install-addon`, turns the add-on on in the saved preferences of each Blender it finds (a copy of Blender starts briefly with no window), and tells you to restart Blender. Open Blender and the add-on connects by itself; **Check Blender** shows what it reports.
+
+- The **Artist** agent works with Blender. Any agent can be given the Blender connection under **Configure → Connections**.
+- `render_preview` renders a turntable, the scene's animation, or a still in your open Blender and posts it in the chat as a playable video (MP4 or WebM) or an image. `share_media` shows an image or video that already exists on your computer. Previews are stored in the app's `media` folder and deleted with their conversation.
+- Looking tools run freely; anything that changes Blender (`execute_blender_code`, `generate_3d`, `import_asset`, `render_preview`) follows the agent's access mode, and the Python of each script is shown before you approve it.
+- The server's usage telemetry is switched off, and its two data-collection tools are hidden from agents.
+
+The add-on listens on this computer only and has no password. Any program on your computer can reach it while Blender is open. See [docs/BLENDER.md](docs/BLENDER.md) for security notes, the exact files touched, and troubleshooting.
 
 ## Desktop builds
 
@@ -238,6 +254,8 @@ npm run build
 npm audit
 ```
 
+Two opt-in groups of tests use a real Blender and open it briefly in a throwaway profile; see [docs/BLENDER.md](docs/BLENDER.md#what-was-verified).
+
 The desktop end-to-end test starts an isolated Electron profile and a local test API. It exercises the visible UI, provider discovery, streamed agent output, skill loading, persistence after restart, and actual plugin installation into a temporary folder. The package smoke test checks the compiled executable, bundled resources, and plugin installer with another isolated profile. These tests do not require paid API credentials or modify the developer’s Studio plugin folder. On a headless Linux host, run desktop tests through a suitable virtual display such as Xvfb.
 
 ## Storage and privacy
@@ -247,10 +265,11 @@ Data is saved under Electron’s per-user application data directory, typically 
 - `workspace.json`: settings, agent definitions, provider metadata, conversations, skills, MCP configuration, and the latest 500 activity events.
 - `credentials.enc`: encrypted API keys, HTTP MCP bearer tokens, the optional Brave Search key, and ChatGPT credentials, when secure OS storage is available.
 - `skills/`: imported local skill collections.
+- `media/`: previews agents posted in chats (videos and images). Only their descriptions are in `workspace.json`; the files are removed when their conversation is deleted.
 
 On Windows, credential encryption uses the OS-backed Electron `safeStorage` implementation. On Linux, the app requires an available secure keyring and rejects the `basic_text` fallback. Without a secure keyring, credentials remain in memory for the current session only. Conversations and configuration are not encrypted at rest.
 
-The renderer has no Node.js access. A narrow preload bridge validates actions in the main process. Credentials are excluded from state snapshots and exports. Provider requests are sent from the main process, and known credentials are redacted from error/activity output. No analytics or telemetry service is configured.
+The renderer has no Node.js access. A narrow preload bridge validates actions in the main process. Credentials are excluded from state snapshots and exports. Provider requests are sent from the main process, and known credentials are redacted from error/activity output. No analytics or telemetry service is configured, and the Blender server's own usage telemetry is switched off.
 
 Messages, selected skill content, MCP tool results, and web page text are sent to the provider selected for the conversation. Local storage does not make a remote provider’s inference private to your device.
 
@@ -259,7 +278,7 @@ Messages, selected skill content, MCP tool results, and web page text are sent t
 ```text
 src/
 ├── main/       Electron lifecycle, validated IPC, storage, OAuth, providers,
-│               skill loader, MCP processes, and agent runtime
+│               skill loader, MCP processes, Blender setup, preview media, and agent runtime
 ├── preload/    Narrow typed renderer bridge
 ├── renderer/   React desktop interface and Dracula-inspired CSS
 └── shared/     Domain types, starter agents, and default instructions
@@ -272,16 +291,18 @@ Independent agent conversations can run concurrently. Each uses a snapshot of it
 ## Current limitations
 
 - Live ChatGPT OAuth, live Anthropic API inference, and real Studio place edits require the user’s account and Studio connection; fixture tests do not establish those external services’ availability.
-- This preview has text-based agent conversations. Image attachments and multimodal screenshot feedback are not implemented.
+- Agents can show you previews, but they cannot see them: images from Blender's `look` tool are left out of the text sent to the model, and you cannot attach images to a message. Multimodal screenshot feedback is not implemented.
 - The Master Agent delegates within one message: worker threads live for that message, and a worker cannot see the conversation or other workers. Workers do not run in the background after the Master answers, and there is no shared task board between conversations.
 - The project folder setting labels your workspace. Direct project filesystem tools, terminal access, and Rojo synchronization are not implemented; Studio access goes through MCP.
 - MCP OAuth discovery, automatic skill updates, configuration import, automatic application updates, and signed releases are not implemented.
 - The app serializes its own Studio calls. It cannot coordinate external MCP clients or manual Studio edits made at the same time.
+- Blender is busy while a preview renders, and Stop cannot interrupt a render already running inside Blender. Previews need Blender on the same computer. The one-click Blender install is verified on Windows with Blender 4.5 and 5.2; macOS and Linux use the same steps but have not been run.
 
 ## Credits and license
 
 - [TabooHarmony/roblox-brain](https://github.com/tabooharmony/roblox-brain): all 29 skills and complete references, MIT; bundled license preserved.
 - [Chrrxs/robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp): Studio MCP server and plugin, MIT; upstream package license preserved.
+- [ahujasid/mcp-for-blender](https://github.com/ahujasid/mcp-for-blender): the Blender add-on and MCP server the integration installs and runs, MIT. Downloaded on first use, not bundled. [uv](https://docs.astral.sh/uv/) by Astral runs it.
 - [Dracula](https://draculatheme.com/): palette inspiration.
 - Electron, React, Lucide, the Model Context Protocol TypeScript SDK, Zod, YAML, and jose.
 
