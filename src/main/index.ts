@@ -264,7 +264,7 @@ async function action(name: string, payload: unknown): Promise<unknown> {
     }
     case 'external:open': {
       const url = z.string().url().parse(payload)
-      const allowed = ['https://github.com/tabooharmony/roblox-brain', 'https://github.com/Chrrxs/robloxstudio-mcp', 'https://chatgpt.com/settings/usage', 'https://platform.openai.com/api-keys', 'https://console.anthropic.com', 'https://code.claude.com/docs/en/legal-and-compliance', BLENDER_REPOSITORY, 'https://docs.astral.sh/uv/']
+      const allowed = ['https://github.com/MrHB102/RbxAgents', 'https://github.com/Chrrxs/robloxstudio-mcp', 'https://chatgpt.com/settings/usage', 'https://platform.openai.com/api-keys', 'https://console.anthropic.com', 'https://code.claude.com/docs/en/legal-and-compliance', BLENDER_REPOSITORY, 'https://docs.astral.sh/uv/']
       if (!allowed.includes(url)) throw new Error('This external link is not allowed.')
       await shell.openExternal(url); return
     }
@@ -279,7 +279,7 @@ app.whenReady().then(() => {
     encrypt: value => safeStorage.encryptString(value), decrypt: value => safeStorage.decryptString(value)
   })
   const resourceRoot = app.isPackaged ? join(process.resourcesPath, 'resources') : join(app.getAppPath(), 'resources')
-  store.state.skills = [...scanSkills(join(resourceRoot, 'roblox-brain', 'skills'), true, 'TabooHarmony/roblox-brain'), ...scanSkills(join(app.getPath('userData'), 'skills'), false, 'Local import')]
+  store.state.skills = [...scanSkills(join(resourceRoot, 'skills'), true, 'RBX Agents'), ...scanSkills(join(app.getPath('userData'), 'skills'), false, 'Local import')]
   mkdirSync(join(app.getPath('userData'), 'skills'), { recursive: true })
   auth = new ChatGPTAuth(store, url => shell.openExternal(url))
   media = new MediaStore(join(app.getPath('userData'), 'media'))

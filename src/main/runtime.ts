@@ -168,7 +168,7 @@ export class AgentRuntime {
     }
     const servers = this.serverSnapshot(agent.mcpIds)
     const tools: ToolSpec[] = []
-    if (skills.length) tools.push({ name: 'load_skill', description: 'Read one page of an enabled skill. Start with SKILL.md; use references/full.md for details. Continue at nextOffset only when needed.', parameters: { type: 'object', properties: { skill_id: { type: 'string', enum: skills.map(s => s.id) }, file: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 500, maximum: 5000 } }, required: ['skill_id'], additionalProperties: false } })
+    if (skills.length) tools.push({ name: 'load_skill', description: 'Read one page of an enabled skill. Start with SKILL.md; read another file in the skill folder only when SKILL.md points to it. Continue at nextOffset only when needed.', parameters: { type: 'object', properties: { skill_id: { type: 'string', enum: skills.map(s => s.id) }, file: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 500, maximum: 5000 } }, required: ['skill_id'], additionalProperties: false } })
     if (servers.length) tools.push(
       { name: 'search_tools', description: 'Find relevant MCP tools and their argument schemas. Search specific actions, for example connected instances, read script, or execute_luau.', parameters: { type: 'object', properties: { query: { type: 'string', maxLength: 200 }, limit: { type: 'integer', minimum: 1, maximum: 5 } }, required: ['query'], additionalProperties: false } },
       { name: 'call_tool', description: 'Execute a tool discovered with search_tools. Use its exact server_id, tool name, and arguments. Access mode is enforced by the application.', parameters: { type: 'object', properties: { server_id: { type: 'string', enum: servers.map(s => s.id) }, name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['server_id', 'name', 'arguments'], additionalProperties: false } }
@@ -622,7 +622,7 @@ export class AgentRuntime {
     if (this.store.state.agents.length >= 30) throw new Error('The workspace already has 30 agents.')
     const name = str('name', 60), role = str('role', 80), description = str('description', 300), systemPrompt = str('system_prompt', 6000), reason = str('reason', 300)
     if (this.store.state.agents.some(a => a.name.toLowerCase() === name.toLowerCase())) throw new Error(`An agent named "${name}" already exists.`)
-    const skillIds = (Array.isArray(args.skill_ids) ? args.skill_ids : ['roblox-collaboration-mode'].filter(id => this.store.state.skills.some(s => s.id === id))).filter((id: unknown): id is string => typeof id === 'string')
+    const skillIds = (Array.isArray(args.skill_ids) ? args.skill_ids : ['collaboration-mode'].filter(id => this.store.state.skills.some(s => s.id === id))).filter((id: unknown): id is string => typeof id === 'string')
     const unknown = skillIds.find(id => !this.store.state.skills.some(s => s.id === id))
     if (unknown) throw new Error(`Skill "${unknown}" is not installed.`)
     const base = this.store.state.agents.find(a => a.id === args.based_on) || this.store.state.agents.find(a => !a.orchestrator && a.enabled && a.model.trim() && a.providerId)

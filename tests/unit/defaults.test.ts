@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
-import { GLOBAL_PROMPT, GLOBAL_PROMPT_V2, LEGACY_AGENT_PROMPTS, LEGACY_GLOBAL_PROMPT, SCHEMA, initialState, migrate } from '../../src/shared/defaults'
+import { GLOBAL_PROMPT, GLOBAL_PROMPT_V2, GLOBAL_PROMPT_V6, renameLegacySkill, LEGACY_AGENT_PROMPTS, LEGACY_GLOBAL_PROMPT, SCHEMA, initialState, migrate } from '../../src/shared/defaults'
 import { parseCommand, parseEffort } from '../../src/shared/commands'
 import { Store } from '../../src/main/store'
 import { resolveModel } from '../../src/main/runtime'
@@ -95,5 +95,18 @@ describe('/model resolution', () => {
     expect(resolveModel('claude', providers, 'a')).toHaveProperty('error')
     expect(resolveModel('brand-new', providers, 'a')).toMatchObject({ model: 'brand-new', note: expect.stringContaining('not in') })
     expect(resolveModel('x', providers, 'missing')).toHaveProperty('error')
+  })
+  it('moves schema 6 workspaces to the bundled skill names, including remembered pages, and keeps custom skills', () => {
+    const state = initialState('host'); state.schema = 6
+    state.settings.globalPrompt = GLOBAL_PROMPT_V6
+    state.agents.find(a => a.id === 'scripter')!.skillIds = ['roblox-collaboration-mode', 'roblox-luau-core', 'luau-core', 'my-skill-1a2b3c4d', 'roblox-unknown']
+    state.sessions.push({ id: 's', memory: { digest: [], pins: [{ key: 'k', skillId: 'roblox-data', file: 'SKILL.md', offset: 0, total: 1, text: 'x' }] } } as never)
+    migrate(state)
+    expect(state.agents.find(a => a.id === 'scripter')!.skillIds).toEqual(['collaboration-mode', 'luau-core', 'my-skill-1a2b3c4d', 'roblox-unknown'])
+    expect(state.sessions[0].memory!.pins[0].skillId).toBe('data')
+    expect(state.settings.globalPrompt).toBe(GLOBAL_PROMPT)
+    expect(GLOBAL_PROMPT).not.toContain('references/full.md')
+    expect(renameLegacySkill('roblox-studio-mcp')).toBe('studio-mcp')
+    expect(renameLegacySkill('roblox-nothing')).toBe('roblox-nothing')
   })
 })

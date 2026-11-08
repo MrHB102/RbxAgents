@@ -61,7 +61,7 @@ test.beforeAll(async () => {
           event({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { total_tokens: 45 } })
         }
       } else if (!payload.messages.some((message: any) => message.role === 'tool')) {
-        event({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_skill', function: { name: 'load_skill', arguments: '{"skill_id":"roblox-architecture"}' } }] } }] })
+        event({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_skill', function: { name: 'load_skill', arguments: '{"skill_id":"architecture"}' } }] } }] })
         event({ choices: [{ delta: {}, finish_reason: 'tool_calls' }], usage: { total_tokens: 25 } })
       } else {
         event({ choices: [{ delta: { content: 'The architecture skill is loaded. Your Roblox project is ready to plan.' } }] })
@@ -88,15 +88,16 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   await expect(page.locator('.agent-card').filter({ has: page.getByRole('heading', { name: 'Master', exact: true }) })).toContainText('Orchestrator')
   await expect(page.getByText('29 skills installed')).toBeVisible()
   await page.screenshot({ path: 'test-results/agents-desktop.png' })
-  // Every upstream skill and reference can be read through the hardened preload bridge.
+  // Every bundled skill can be read through the hardened preload bridge.
   await page.getByRole('button', { name: 'Skill library', exact: true }).click()
   await expect(page.locator('.skill-card')).toHaveCount(29)
   await page.getByRole('button', { name: 'Core', exact: true }).click()
   await expect(page.locator('.skill-card')).toHaveCount(10)
   await page.locator('.skill-card').filter({ has: page.getByRole('heading', { name: 'architecture', exact: true }) }).click()
   await expect(page.getByRole('dialog')).toBeVisible()
-  await page.getByRole('button', { name: 'Full reference', exact: true }).click()
+  // The bundled skills are single SKILL.md files, so there is no separate reference to open.
   await expect(page.locator('.skill-document')).toContainText('Architecture')
+  await expect(page.getByRole('button', { name: 'Full reference', exact: true })).toHaveCount(0)
   await page.getByRole('button', { name: 'Close dialog' }).click()
   // Save and discover an OpenAI-compatible provider through the visible form.
   await page.getByRole('button', { name: 'Providers', exact: true }).click()

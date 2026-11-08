@@ -8,6 +8,17 @@ export function isWithin(root: string, target: string) {
   const rel = relative(resolve(root), resolve(target))
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !/^[A-Za-z]:/.test(rel) && !rel.startsWith(sep))
 }
+/** The bundled library is a flat folder of skills; this groups them for the library view. A nested collection uses its folder names instead. */
+export const BUILTIN_SKILL_CATEGORIES: Record<string, string> = {
+  architecture: 'core', 'collaboration-mode': 'core', data: 'core', 'luau-core': 'core', 'luau-patterns': 'core', 'luau-types': 'core', networking: 'core', performance: 'core', security: 'core', 'server-data': 'core',
+  'animation-vfx': 'gameplay', audio: 'gameplay', building: 'gameplay', camera: 'gameplay', gui: 'gameplay', input: 'gameplay', lighting: 'gameplay', localization: 'gameplay', 'npc-ai': 'gameplay', physics: 'gameplay',
+  analytics: 'design', 'game-design': 'design', 'growth-design': 'design', monetization: 'design', 'player-psychology': 'design',
+  cloud: 'tools', 'publish-checklist': 'tools', 'studio-mcp': 'tools', tooling: 'tools'
+}
+function builtinCategory(root: string, path: string, name: string) {
+  const parts = relative(root, path).split(sep)
+  return parts.length > 2 ? parts[0] : BUILTIN_SKILL_CATEGORIES[name] || 'general'
+}
 export function scanSkills(root: string, builtin: boolean, source: string): Skill[] {
   if (!existsSync(root)) return []
   const found: Skill[] = []
@@ -23,7 +34,7 @@ export function scanSkills(root: string, builtin: boolean, source: string): Skil
         let metadata: Record<string, unknown> = {}
         try { metadata = header ? parse(header[1]) || {} : {} } catch { /* A custom skill may omit YAML. */ }
         const name = String(metadata.name || relative(root, directory).split(sep).at(-1))
-        found.push({ id: builtin ? name : `${name}-${createHash('sha256').update(path).digest('hex').slice(0, 8)}`, name, description: String(metadata.description || 'Custom agent skill'), category: builtin ? relative(root, path).split(sep)[0] : 'custom', source, path, builtin })
+        found.push({ id: builtin ? name : `${name}-${createHash('sha256').update(path).digest('hex').slice(0, 8)}`, name, description: String(metadata.description || 'Custom agent skill'), category: builtin ? builtinCategory(root, path, name) : 'custom', source, path, builtin, references: existsSync(join(directory, 'references', 'full.md')) })
       }
     }
   }

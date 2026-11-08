@@ -1,16 +1,20 @@
-import { readdir, readFile, access } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-const root = new URL('../resources/roblox-brain/', import.meta.url)
-const manifest = JSON.parse(await readFile(new URL('manifest.json', root), 'utf8'))
-let count = 0
-async function walk(path) {
-  for (const entry of await readdir(path, { withFileTypes: true })) {
-    if (entry.isDirectory()) await walk(join(path, entry.name))
-    else if (entry.name === 'SKILL.md') { count++; await access(join(path, 'references/full.md')) }
-  }
+import { parse } from 'yaml'
+const root = fileURLToPath(new URL('../resources/skills/', import.meta.url))
+const manifest = JSON.parse(await readFile(join(root, 'manifest.json'), 'utf8'))
+const names = new Set()
+for (const entry of await readdir(root, { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue
+  const text = await readFile(join(root, entry.name, 'SKILL.md'), 'utf8')
+  const header = text.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!header) throw new Error(`${entry.name}/SKILL.md has no front matter.`)
+  const metadata = parse(header[1]) || {}
+  if (metadata.name !== entry.name) throw new Error(`${entry.name}/SKILL.md declares the name "${metadata.name}"; it must match its folder.`)
+  if (!String(metadata.description || '').trim()) throw new Error(`${entry.name}/SKILL.md has no description.`)
+  if (text.length < 500) throw new Error(`${entry.name}/SKILL.md looks empty.`)
+  names.add(metadata.name)
 }
-await walk(fileURLToPath(new URL('skills/', root)))
-if (count !== manifest.skillCount) throw new Error(`Expected ${manifest.skillCount} complete skills; found ${count}.`)
-await access(new URL('LICENSE', root))
-console.log(`Verified ${count} bundled skills, all reference files, provenance, and MIT license.`)
+if (names.size !== manifest.skillCount) throw new Error(`Expected ${manifest.skillCount} skills; found ${names.size}.`)
+console.log(`Verified ${names.size} bundled skills: front matter, names that match their folders, and descriptions.`)

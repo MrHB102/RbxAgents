@@ -17,7 +17,7 @@ export interface Agent {
   /** Can search the web and read public pages. On unless set to false. Orchestrators delegate research instead. */
   web?: boolean
 }
-export interface Skill { id: string; name: string; description: string; category: string; source: string; path: string; builtin: boolean }
+export interface Skill { id: string; name: string; description: string; category: string; source: string; path: string; builtin: boolean; /** The skill folder also holds references/full.md. */ references?: boolean }
 export interface McpServer {
   id: string; name: string; transport: 'bundled' | 'stdio' | 'http' | 'sse'; command: string
   args: string[]; url: string; env: Record<string, string>; status: 'disconnected' | 'connecting' | 'connected' | 'error'

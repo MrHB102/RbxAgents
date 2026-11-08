@@ -24,7 +24,7 @@ Built with a clean Dracula-inspired interface, a complete Roblox skill library, 
 - **Steer while it works.** Send a message at any time: it is delivered before the agent's next step. Use `/btw` for a side question, `/model` and `/effort` to change model and reasoning depth from the chat.
 - **Choose a model for each agent.** Connect OpenAI-compatible APIs, local inference servers, Anthropic, your installed Claude Code, or an eligible ChatGPT account. Discover models or enter a model ID yourself.
 - **Set their instructions.** Combine a workspace system prompt, individual agent instructions, and selected skills.
-- **Use all 29 Roblox skills offline.** The complete [roblox-brain](https://github.com/tabooharmony/roblox-brain) library ships with the app, including every `references/full.md`. Import additional local skill collections.
+- **Use all 29 Roblox skills offline.** The RBX Agents skill library ships with the app, one `SKILL.md` per skill. Import additional local skill collections.
 - **Connect directly to Studio.** The [Chrrxs Roblox Studio MCP](https://github.com/Chrrxs/robloxstudio-mcp) server and matching plugin are bundled. Install the plugin from inside the app without a separate Node.js installation.
 - **Model and animate in Blender.** Connect [MCP for Blender](https://github.com/ahujasid/mcp-for-blender) with one click. The **Artist** agent inspects your scene, runs Blender Python (with your approval), and **posts rendered previews straight into the chat**: turntable videos, animation clips, and stills that play right there. See [docs/BLENDER.md](docs/BLENDER.md).
 - **Choose an access mode.** Use Ask before changes, Read only, or **Unrestricted access** to execute tools without approval prompts. Calls to the same MCP server are serialized across agents.
@@ -76,7 +76,7 @@ For a planning-only conversation, turn off the agent’s MCP connections in **Co
 Economy context handling is on by default, including for existing agents:
 
 - The model receives a small `search_tools` / `call_tool` interface instead of every connected MCP tool definition on every request. Exact tool schemas are discovered only when needed.
-- All 29 skills remain installed. Skill instructions and references are loaded in pages of up to 5,000 characters. **Pages an agent has read are remembered for the whole conversation** (up to 9,000 characters, oldest evicted first) and shared with the workers that have the skill, so they are neither fetched nor re-paid for on every message.
+- All 29 skills remain installed. Skill instructions are loaded in pages of up to 5,000 characters. **Pages an agent has read are remembered for the whole conversation** (up to 9,000 characters, oldest evicted first) and shared with the workers that have the skill, so they are neither fetched nor re-paid for on every message.
 - **Session memory replaces the old "forget on the next message" behavior.** The last three exchanges are sent verbatim. Older ones are folded locally into one line each (request, actions, result), together with a short list of recent actions and the current plan. No model call is used to summarize. `/compact` and `/clear` control this by hand.
 - **Prompt caching.** For Anthropic models the app marks tools, system blocks, and the newest message as cacheable, so every step of a run re-reads its prefix at the cached price. Instructions are kept byte-stable between steps. OpenAI caches stable prefixes on its own; other OpenAI-compatible servers vary.
 - Tool text results are capped at 6,000 characters. Supported inline tool images are sent separately to vision-capable models; their base64 is excluded from textual logs and workspace JSON. Up to two images per result (4 MB each) and four recent images in model context are retained. Images add provider token usage.
@@ -165,16 +165,16 @@ How the Claude Code connection works:
 
 ## Bundled Roblox skills
 
-All four upstream collections are included. No network access is required to browse or load them after installation.
+The 29 skills in [resources/skills](resources/skills) are written for RBX Agents. Each skill is a single self-contained `SKILL.md` with its own "when to use" and "when not to use" sections. No network access is required to browse or load them after installation.
 
 | Collection | Skills |
 | --- | --- |
-| **Core · 10** | `roblox-collaboration-mode`, `roblox-luau-core`, `roblox-luau-types`, `roblox-luau-patterns`, `roblox-architecture`, `roblox-networking`, `roblox-security`, `roblox-data`, `roblox-server-data`, `roblox-performance` |
-| **Gameplay · 10** | `roblox-building`, `roblox-physics`, `roblox-npc-ai`, `roblox-camera`, `roblox-input`, `roblox-gui`, `roblox-animation-vfx`, `roblox-lighting`, `roblox-audio`, `roblox-localization` |
-| **Design · 5** | `roblox-game-design`, `roblox-player-psychology`, `roblox-growth-design`, `roblox-analytics`, `roblox-monetization` |
-| **Tools · 4** | `roblox-studio-mcp`, `roblox-tooling`, `roblox-cloud`, `roblox-publish-checklist` |
+| **Core · 10** | `collaboration-mode`, `luau-core`, `luau-types`, `luau-patterns`, `architecture`, `networking`, `security`, `data`, `server-data`, `performance` |
+| **Gameplay · 10** | `building`, `physics`, `npc-ai`, `camera`, `input`, `gui`, `animation-vfx`, `lighting`, `audio`, `localization` |
+| **Design · 5** | `game-design`, `player-psychology`, `growth-design`, `analytics`, `monetization` |
+| **Tools · 4** | `studio-mcp`, `tooling`, `cloud`, `publish-checklist` |
 
-The upstream commit and license are preserved in [resources/roblox-brain](resources/roblox-brain). The runtime exposes a skill catalog and a `load_skill` tool so agents can read selected instructions and reference files on demand. The collaboration-mode entry point is also included automatically when selected.
+The runtime exposes a skill catalog and a `load_skill` tool so agents can read selected instructions on demand, and other files in a skill folder when its `SKILL.md` points to them. The `collaboration-mode` entry point is also included automatically when selected. The Collection grouping is a library filter only; skills are identified by their plain names. Workspaces created before 0.3.1 are upgraded automatically: the old `roblox-` prefixed skill ids on agents and remembered skill pages are renamed.
 
 To add a custom skill, choose **Skill library → Import skills**, then select a folder containing one or more `SKILL.md` files. The app copies the collection into its local data folder. Enable imported skills separately for each agent.
 
@@ -284,7 +284,7 @@ src/
 ├── preload/    Narrow typed renderer bridge
 ├── renderer/   React desktop interface and Dracula-inspired CSS
 └── shared/     Domain types, starter agents, and default instructions
-resources/     Complete bundled Roblox skill library and attribution
+resources/     Bundled Roblox skill library (resources/skills) and attribution
 tests/         Unit tests and Electron desktop integration tests
 ```
 
@@ -302,7 +302,6 @@ Independent agent conversations can run concurrently. Each uses a snapshot of it
 
 ## Credits and license
 
-- [TabooHarmony/roblox-brain](https://github.com/tabooharmony/roblox-brain): all 29 skills and complete references, MIT; bundled license preserved.
 - [Chrrxs/robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp): Studio MCP server and plugin, MIT; upstream package license preserved.
 - [ahujasid/mcp-for-blender](https://github.com/ahujasid/mcp-for-blender): the Blender add-on and MCP server the integration installs and runs, MIT. Downloaded on first use, not bundled. [uv](https://docs.astral.sh/uv/) by Astral runs it.
 - [Dracula](https://draculatheme.com/): palette inspiration.

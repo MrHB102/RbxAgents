@@ -17,10 +17,10 @@ function fixture(script: Script, configure: (store: Store) => void = () => {}, w
   for (const agent of store.state.agents) { agent.providerId = 'local'; agent.model = agent.orchestrator ? 'big-model' : 'small-model'; agent.permission = 'unrestricted' }
   store.state.servers[0].status = 'connected'
   store.state.servers[0].tools = [{ name: 'get_script_source', description: 'Read a script', inputSchema: { type: 'object' }, readOnly: true }, { name: 'execute_luau', description: 'Mutate Studio', inputSchema: { type: 'object' }, readOnly: false }]
-  const skillDirectory = join(directory, 'skills', 'roblox-luau-core')
+  const skillDirectory = join(directory, 'skills', 'luau-core')
   mkdirSync(skillDirectory, { recursive: true })
   writeFileSync(join(skillDirectory, 'SKILL.md'), 'LUAU CORE KNOWLEDGE '.repeat(50))
-  store.state.skills.push({ id: 'roblox-luau-core', name: 'roblox-luau-core', description: 'Luau', category: 'core', source: 'test', path: join(skillDirectory, 'SKILL.md'), builtin: true })
+  store.state.skills.push({ id: 'luau-core', name: 'luau-core', description: 'Luau', category: 'core', source: 'test', path: join(skillDirectory, 'SKILL.md'), builtin: true })
   configure(store)
   const now = new Date().toISOString()
   for (const agent of store.state.agents) store.state.sessions.push({ id: agent.id, agentId: agent.id, title: 'Task', messages: [], createdAt: now, updatedAt: now, status: 'idle', tokens: 0 })
@@ -150,9 +150,9 @@ describe('slash commands', () => {
 describe('memory across messages', () => {
   it('keeps a loaded skill page for later messages instead of reading it again', async () => {
     const { store, runtime, calls, cleanup } = fixture(({ turns, index }) => {
-      if (index === 0) return { calls: [{ name: 'load_skill', arguments: { skill_id: 'roblox-luau-core' } }] }
+      if (index === 0) return { calls: [{ name: 'load_skill', arguments: { skill_id: 'luau-core' } }] }
       if (index === 1) return { text: 'Loaded.' }
-      if (index === 2) return { calls: [{ name: 'load_skill', arguments: { skill_id: 'roblox-luau-core' } }] }
+      if (index === 2) return { calls: [{ name: 'load_skill', arguments: { skill_id: 'luau-core' } }] }
       return { text: `memory=${turns.some(t => t.role === 'system' && t.content.includes('LUAU CORE KNOWLEDGE'))}` }
     })
     try {
@@ -323,7 +323,7 @@ describe('Master Agent', () => {
   })
 
   it('always asks before creating an agent, even in Unrestricted mode, and never auto-approves it', async () => {
-    const create = { name: 'Animator', role: 'Animation', description: 'Builds animations', system_prompt: 'You animate rigs.', skill_ids: ['roblox-luau-core'], reason: 'No worker covers animation.' }
+    const create = { name: 'Animator', role: 'Animation', description: 'Builds animations', system_prompt: 'You animate rigs.', skill_ids: ['luau-core'], reason: 'No worker covers animation.' }
     const { store, runtime, cleanup } = fixture(({ who, index }) => who === 'master' && index === 0 ? { calls: [{ name: 'create_agent', arguments: create }] } : { text: 'Done.' })
     try {
       await runtime.send('master', 'I need animation work.')
@@ -450,8 +450,8 @@ describe('Claude Code connection', () => {
       delta('Looking. ')
       seen.outputs.push(await options.execute('call_tool', { server_id: 'roblox', name: 'get_script_source', arguments: {} }))
       await runtime.send('scripter', 'Also rename it.')
-      seen.outputs.push(await options.execute('load_skill', { skill_id: 'roblox-luau-core' }))
-      seen.outputs.push(await options.execute('load_skill', { skill_id: 'roblox-luau-core' }))
+      seen.outputs.push(await options.execute('load_skill', { skill_id: 'luau-core' }))
+      seen.outputs.push(await options.execute('load_skill', { skill_id: 'luau-core' }))
       delta('Done.')
       return { text: 'Done.', tokens: 5, calls: [] }
     })

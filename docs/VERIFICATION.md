@@ -1,5 +1,14 @@
 # Verification record
 
+## Own skill library 0.3.1 — November 8, 2026
+
+- The bundled TabooHarmony/roblox-brain library (29 skills with `references/full.md`) was removed and replaced by 29 original skills in `resources/skills`, one `SKILL.md` each. The earlier "Upstream file comparison" row below applies to the removed library only.
+- `npm run verify:skills` now checks every skill's front matter: the `name` must match its folder, a description must exist, and the count must equal the manifest (29).
+- `npm test`: 161 passed, 11 opt-in live tests skipped. New coverage: the 29 bundled names, category grouping (flat library and nested collections), every skill used by the default agents is bundled, and the schema 7 upgrade of `roblox-` prefixed skill ids on agents and remembered pages.
+- `npx playwright test`: 3 desktop scenarios passed (29 skills in the library, `architecture` loaded through the provider loop, no "Full reference" button for single-file skills).
+- Windows installers (x64, ARM64 and combined, unsigned) were built into `release/v0.3.1`. The packaged x64 app passed the isolated smoke test (`scripts/smoke-package.mjs`: renderer, 29 skills, access mode, Blender defaults, preview protocol, plugin installer). The ARM64 installer was built but not executed; Linux packages were not built for this release.
+- Not verified: the content quality of the skills themselves was not reviewed or measured against model behavior; only structure and loading were tested.
+
 ## Blender bridge 0.2.3 — November 4, 2026
 
 - Found two independent per-call cutoffs: 120 seconds in RBX Agents and a hardcoded 180-second socket read in `mcp-for-blender@2.2.4`. Blender calls now allow 610 seconds, and the pinned uvx server is launched with a process-local adapter extending its socket read to 600 seconds. Custom bridge commands are preserved. Render previews share the same policy.

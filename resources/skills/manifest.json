@@ -1,0 +1,7 @@
+{
+  "name": "RBX Agents skills",
+  "author": "MrHB102",
+  "version": "0.3.1",
+  "skillCount": 29,
+  "contents": "Original RBX Agents skills. Each folder holds a single self-contained SKILL.md."
+}
