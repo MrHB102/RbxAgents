@@ -178,7 +178,8 @@ describe('memory across messages', () => {
       const memory = last.turns.filter(t => t.role === 'system').map(t => t.content).join('\n')
       expect(memory).toContain('Request number 0')
       expect(memory).toContain('Request number 2')
-      expect(memory).not.toContain('Request number 4')
+      expect(memory.split('## Earlier in this conversation')[1]).not.toContain('Request number 4')
+      expect(memory).toContain('User update: Request number 4')
       expect(store.state.sessions.find(s => s.id === 'scripter')!.memory?.digest).toHaveLength(3)
     } finally { cleanup() }
   })
@@ -186,6 +187,72 @@ describe('memory across messages', () => {
 
 describe('Master Agent', () => {
   const delegate = (...tasks: { agent_id: string; brief: string }[]) => ({ calls: [{ name: 'delegate', arguments: { tasks } }] })
+
+  it('stops a delegated provider that ignores abort, including workers waiting for a slot', async () => {
+    const f = fixture(({ who }) => who === 'worker' ? new Promise(() => {}) : delegate(
+      { agent_id: 'scripter', brief: 'A' }, { agent_id: 'reviewer', brief: 'B' }
+    ), store => { store.state.settings.maxConcurrent = 1 })
+    try {
+      await f.runtime.send('master', 'Delegate.')
+      await vi.waitFor(() => expect(f.calls.filter(c => c.who === 'worker')).toHaveLength(1))
+      f.runtime.stop('master')
+      await idle(f.runtime, 'master')
+      expect(f.store.state.sessions.find(s => s.id === 'master')!.lastRun!.threads!.every(t => t.status !== 'running')).toBe(true)
+    } finally { f.cleanup() }
+  })
+
+  it('isolates malformed tasks so valid sibling delegations still finish', async () => {
+    const f = fixture(({ who, index }) => who === 'worker' ? { text: 'Valid report.' }
+      : index === 0 ? { calls: [{ name: 'delegate', arguments: { tasks: [null, { agent_id: 'scripter', brief: 'A' }] } }] }
+      : { text: 'Done.' })
+    try {
+      await f.runtime.send('master', 'Go.')
+      await idle(f.runtime, 'master')
+      expect(f.store.state.sessions.find(s => s.id === 'master')!.messages.find(m => m.content.startsWith('delegate'))?.content).toContain('Valid report.')
+    } finally { f.cleanup() }
+  })
+
+  it('stops a send_to_agent follow-up and ignores a late provider response', async () => {
+    const hold = gate()
+    let workerCalls = 0
+    const f = fixture(async ({ who, turns, index }) => {
+      if (who === 'worker') {
+        if (++workerCalls === 2) await hold.promise
+        return { text: 'Worker report.' }
+      }
+      if (index === 0) return delegate({ agent_id: 'scripter', brief: 'A' })
+      if (!turns.some(t => t.tool_calls?.some(c => c.function.name === 'send_to_agent'))) return { calls: [{ name: 'send_to_agent', arguments: { thread_id: 'scripter-1', message: 'Continue.' } }] }
+      return { text: 'Final.' }
+    })
+    try {
+      await f.runtime.send('master', 'Go.')
+      await vi.waitFor(() => expect(workerCalls).toBe(2))
+      f.runtime.stop('master')
+      await idle(f.runtime, 'master')
+      const session = f.store.state.sessions.find(s => s.id === 'master')!
+      const before = JSON.stringify(session)
+      hold.open()
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(JSON.stringify(session)).toBe(before)
+      expect(session.lastRun?.threads?.[0].status).toBe('error')
+    } finally { hold.open(); f.cleanup() }
+  })
+
+  it('keeps waiting status until every parallel approval is resolved', async () => {
+    const f = fixture(({ who, turns, index }) => who === 'worker'
+      ? turns.some(t => t.role === 'tool') ? { text: 'Done.' } : { calls: [{ name: 'call_tool', arguments: { server_id: 'roblox', name: 'execute_luau', arguments: {} } }] }
+      : index === 0 ? delegate({ agent_id: 'scripter', brief: 'A' }, { agent_id: 'reviewer', brief: 'B' }) : { text: 'Done.' },
+      store => { for (const a of store.state.agents) a.permission = 'ask' })
+    try {
+      await f.runtime.send('master', 'Go.')
+      await vi.waitFor(() => expect(f.store.approvals).toHaveLength(2))
+      f.runtime.decide(f.store.approvals[0].id, true)
+      await vi.waitFor(() => expect(f.mcpCall).toHaveBeenCalled())
+      expect(f.store.state.sessions.find(s => s.id === 'master')!.status).toBe('waiting')
+      f.runtime.decide(f.store.approvals[0].id, true)
+      await idle(f.runtime, 'master')
+    } finally { f.cleanup() }
+  })
 
   it('delegates a self-contained brief to a worker and receives only its report', async () => {
     const { store, runtime, calls, cleanup } = fixture(({ who, turns, index }) => who === 'worker'
@@ -297,6 +364,79 @@ describe('Master Agent', () => {
       await idle(runtime, 'master')
       expect(calls.at(-1)!.turns.filter(t => t.role === 'system').map(t => t.content).join('\n')).toContain('[ ] s2: Build (builder)')
     } finally { cleanup() }
+  })
+})
+
+describe('visual work acceptance', () => {
+  const image = { type: 'image', mimeType: 'image/png', data: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64') }
+  const brief = { name: 'set_brief', arguments: { goal: 'A blue bridge', constraints: ['Keep castle'], references: ['Reference A'], acceptance: ['Blue bridge'], visual: true } }
+  const call = (name: string) => ({ name: 'call_tool', arguments: { server_id: 'roblox', name, arguments: {} } })
+  const review = { name: 'assess_quality', arguments: { verdict: 'pass', criteria: [{ criterion: 'Blue bridge', status: 'pass', evidence: 'Post-change viewport image.' }], issues: [] } }
+  const configure = (store: Store) => { store.state.servers[0].tools.push(...['capture_screenshot', 'get_asset_thumbnail', 'get_scene_info'].map(name => ({ name, description: name, readOnly: true, inputSchema: { type: 'object' } }))) }
+
+  it('requires fresh scene images, rejecting reference images and a review made before a later mutation', async () => {
+    const steps = [brief, call('execute_luau'), call('get_asset_thumbnail'), review, call('capture_screenshot'), review, call('execute_luau'), review, call('get_scene_info'), review, call('capture_screenshot'), review]
+    const f = fixture(({ index }) => index < steps.length ? { calls: [steps[index]] } : { text: 'Verified bridge.' }, configure)
+    f.mcpCall.mockImplementation(async (...args: any[]) => ({ content: ['capture_screenshot', 'get_asset_thumbnail'].includes(args[1]) ? [image] : [{ type: 'text', text: 'Readback' }] }) as any)
+    try {
+      await f.runtime.send('builder', 'Crie um cenário com uma ponte azul e preserve o castelo.')
+      await idle(f.runtime, 'builder')
+      const session = f.store.state.sessions.find(s => s.id === 'builder')!
+      const results = session.messages.filter(m => m.content.startsWith('assess_quality')).map(m => JSON.parse(m.content.split('\n').slice(1).join('\n')))
+      expect(results).toHaveLength(5)
+      expect(results[0].error).toContain('latest change')
+      expect(results[1].verdict).toBe('pass')
+      expect(results[2].error).toContain('latest change')
+      expect(results[3].error).toContain('actual image')
+      expect(results[4].verdict).toBe('pass')
+      expect(f.calls.some(c => c.turns.some(t => t.images?.length))).toBe(true)
+      expect(JSON.stringify(f.store.state)).not.toContain(image.data)
+      expect(session.status).toBe('idle')
+    } finally { f.cleanup() }
+  })
+
+  it('shares the full brief and actual worker images with the Master, with paged reports', async () => {
+    let masterStep = 0
+    const report = 'Evidence details.\n'.repeat(700) + 'END: keep castle and Reference A.'
+    const f = fixture(({ who, turns }) => {
+      if (who === 'worker') {
+        const step = turns.filter(t => t.role === 'tool').length
+        return step < 2 ? { calls: [call(step === 0 ? 'execute_luau' : 'capture_screenshot')] } : { text: report }
+      }
+      const steps = [brief, { name: 'delegate', arguments: { tasks: [{ agent_id: 'scripter', brief: 'Build bridge.' }] } }, { name: 'read_agent_report', arguments: { thread_id: 'scripter-1', offset: report.length - 100 } }, review]
+      return masterStep < steps.length ? { calls: [steps[masterStep++]] } : { text: 'Reviewed actual view.' }
+    }, configure)
+    f.mcpCall.mockImplementation(async (...args: any[]) => ({ content: args[1] === 'capture_screenshot' ? [image] : [{ type: 'text', text: 'Mutation readback' }] }) as any)
+    try {
+      await f.runtime.send('master', 'Coordinate the bridge and keep my castle.')
+      await idle(f.runtime, 'master')
+      const worker = f.calls.find(c => c.who === 'worker')!
+      expect(worker.turns[1].content).toContain('Reference A')
+      expect(worker.turns[1].content).toContain('Keep castle')
+      const masterCalls = f.calls.filter(c => c.who === 'master')
+      expect(masterCalls.some(c => c.turns.some(t => t.role === 'tool' && t.images?.length))).toBe(true)
+      const session = f.store.state.sessions.find(s => s.id === 'master')!
+      expect(session.messages.find(m => m.content.startsWith('read_agent_report'))?.content).toContain('END: keep castle')
+      expect(session.messages.at(-1)?.content).toBe('Reviewed actual view.')
+    } finally { f.cleanup() }
+  })
+
+  it('keeps an unreviewed visual task active and lets it disclose missing evidence as blocked', async () => {
+    let step = 0
+    const f = fixture(() => {
+      if (step++ === 0) return { calls: [brief] }
+      if (step === 2) return { calls: [call('execute_luau')] }
+      if (step === 3) return { text: 'Attempted finish without review.' }
+      if (step === 4) return { calls: [{ name: 'assess_quality', arguments: { verdict: 'blocked', criteria: [{ criterion: 'Blue bridge', status: 'unverified', evidence: 'No screenshot capability.' }], issues: ['Appearance remains unverified.'] } }] }
+      return { text: 'Built, but appearance remains unverified.' }
+    })
+    try {
+      await f.runtime.send('builder', 'Build a map with a bridge.')
+      await idle(f.runtime, 'builder')
+      expect(f.calls).toHaveLength(5)
+      expect(f.calls[3].turns.at(-1)?.content).toContain('no accepted quality review')
+      expect(f.store.state.sessions.find(s => s.id === 'builder')!.messages.at(-1)?.content).toContain('unverified')
+    } finally { f.cleanup() }
   })
 })
 

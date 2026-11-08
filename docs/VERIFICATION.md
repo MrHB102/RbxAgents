@@ -1,5 +1,69 @@
 # Verification record
 
+## Blender bridge 0.2.3 — November 4, 2026
+
+- Found two independent per-call cutoffs: 120 seconds in RBX Agents and a hardcoded 180-second socket read in `mcp-for-blender@2.2.4`. Blender calls now allow 610 seconds, and the pinned uvx server is launched with a process-local adapter extending its socket read to 600 seconds. Custom bridge commands are preserved. Render previews share the same policy.
+- Stdio stderr is consumed to prevent Python logging from filling an unread pipe. A real stdio fixture writes 2 MiB of stderr per call and still completes serialized requests.
+- `npm test`: 158 passed, 11 opt-in live tests skipped. The focused MCP suite also passed after the final stream-drain adjustment. Its SDK-backed simulated clock test crosses 181 seconds, checks cancellation, and verifies timeout diagnostics without replaying mutations.
+- `RBX_LIVE_BLENDER_MCP=1 npx vitest run tests/unit/blender-bridge.live.test.ts`: passed. The real pinned Python MCP server completed a 185-second response from an isolated TCP add-on fixture with exactly one execution. No real Blender scene or user profile was modified.
+- `npm run build`: TypeScript and production build passed. Real Blender geometry generation and long GPU renders were not exercised by this regression test.
+- Windows x64 installer generated at `release/blender-connection-fix/windows/RBX-Agents-0.2.3-win-x64.exe`. After packaging finished, the isolated packaged smoke test passed (renderer, version, skills, Blender defaults, media protocol and temporary plugin installation). An earlier smoke attempt while packaging was still modifying the payload timed out; the completed payload passed on rerun. The packaged ASAR version and runtime SHA-256 match the build. Installer size/header and SHA-256 were verified; checksums are in `release/blender-connection-fix/SHA256SUMS.txt`. Installer is unsigned. Other platform installers were not regenerated in this fix.
+
+## Windows 0.2.2 installers — November 2, 2026
+
+Updated Windows installers containing the quality-workflow implementation were generated in `release/quality-update/`: separate x64 and ARM64 installers, a combined x64/ARM64 installer, and a legacy x86 installer. Current targets use Electron 45.0.0; x86 uses 43.8.3. Package metadata and lockfile were advanced to application version 0.2.2 without creating a Git tag.
+
+The production build and TypeScript checks passed. Packaged smoke tests passed for x64 and x86 using isolated profiles, including renderer startup, 29 skills, access-mode settings, media protocol registration and installation of the bundled plugin into a temporary folder. PE architecture headers, packaged version and identical runtime SHA-256 were checked for x64, ARM64 and x86. All four installers passed size/header checks; hashes and sizes are in `SHA256SUMS.txt` and `build-manifest.json` in the output folder. Windows signing status is unsigned. ARM64 was inspected but not executed on ARM hardware.
+
+## Quality workflow and headless desktop — November 2, 2026
+
+- `npm run build`: TypeScript and production builds passed on Windows; the Linux headless job also built successfully.
+- `npm test -- --maxWorkers=2 --reporter=dot`: 157 passed, 10 opt-in live tests skipped (23 files).
+- `npm run test:headless:linux`: 3 desktop scenarios passed under Ubuntu 24.04/WSL2 with Xvfb. The latest run completed in 18.8 seconds after building.
+- The third desktop scenario performs an initial acceptance review, dispatches a later mutation, attempts to finish with stale evidence, then obtains another image and passes a new review. The session ends idle with its acceptance contract and current review persisted.
+- Provider tests cover actual image payload shapes, parallel tool-result ordering, GPT-6 effort/Responses routing, opaque reasoning and assistant-phase replay, native Claude image input/output, image budgets, and rejection of stale/reference-only visual acceptance. Local image inspection approval and refusal paths are covered.
+- The Blender fixture now returns real PNG image content from `look`. Desktop tests verify that those pixels reach the fixture provider without entering workspace JSON.
+
+Logs and screenshots are under `test-results/headless-linux/`; `headless.log` records the build and test verdicts, and `visual-acceptance-headless.png` shows the guarded completion flow. These tests use an isolated profile, local fixture API and MCP processes. They do not measure live model aesthetics or establish real Studio/Blender availability. The prior installers in `release/communication-fix/` predate this implementation. See [ROQER_COMPARISON.md](ROQER_COMPARISON.md) for findings, source references and remaining differences.
+
+## Agent communication fixes — November 1, 2026
+
+Verified in the source workspace on Windows x64. Updated distribution files were subsequently generated in `release/communication-fix/`, as recorded below.
+
+- `npm test -- --reporter=dot --maxWorkers=2`: 142 passed, 10 opt-in live tests skipped. Two workers avoid overloading process-startup tests with short polling deadlines.
+- `npm run build`: TypeScript and production builds passed.
+- `npx playwright test`: both desktop scenarios passed against isolated local fixtures.
+- `git diff --check`: passed.
+
+Communication failure paths corrected:
+
+- A delegated model or MCP connection that ignores cancellation no longer prevents Stop from completing. A stopped run rejects late output and cancels remaining workers, including those waiting for execution slots.
+- Claude Code now reports a lost tool-result connection, even if the subprocess remains alive. Silent inference fails after two minutes without stdout; the inactivity timer is suspended during tool execution, delegation, and human approval. Long productive tasks retain their unlimited tool loop.
+- Cancelling a queued MCP call returns immediately while preserving serialization for later actions.
+- A malformed delegation task returns its own error instead of discarding valid sibling reports.
+- Parallel approvals retain the waiting state until all are resolved, and approvals in other conversations stay visible in the global banner.
+- Restart recovery restores queued user messages to the next model context and clears stale running worker statuses.
+- Claude Code side questions now receive the required callback while retaining their tool-free behavior. Windows subprocess cleanup retries transient folder locks.
+
+Regression coverage includes cancellation during `send_to_agent`, late provider responses, a blocked worker plus a queued worker, mixed valid/invalid task batches, concurrent approvals, cancelled MCP waiters, subprocess silence, connection loss during a tool, long tool execution, and restart recovery. Live paid model inference and real Studio mutations were not exercised in this patch; the exact original incident could not be matched to a provider log supplied by the user.
+
+## Distribution builds — November 1, 2026
+
+All six architecture targets configured by the project were packaged from the corrected runtime, keeping application version 0.2.1:
+
+| System | Architecture | Distribution formats | Electron |
+| --- | --- | --- | --- |
+| Windows | x64, ARM64 | Separate NSIS installers plus a combined installer | 45.0.0 |
+| Windows legacy | x86 / ia32 | NSIS installer | 43.8.3 |
+| Linux | x64, ARM64 | AppImage and Debian package for each architecture | 45.0.0 |
+| Linux legacy | ARMv7 / armv7l | tar.gz | 43.8.3 |
+
+Nine distribution files and their `SHA256SUMS.txt` are in `release/communication-fix/`. A Portuguese `LEIA-ME.md` identifies each file. Older files in the release root were preserved. The package homepage was added to `package.json` to fix the existing Debian build failure caused by missing project metadata.
+
+Verification passed for PE/ELF architecture headers and identical SHA-256 hashes of `out/main/index.js` extracted from all six ASARs. Both Debian package payloads contain the same ASAR as their corresponding application trees; their architecture/version fields were checked. The ARMv7 tar archive was read successfully through its end.
+
+Packaged smoke tests passed on Windows x64 and x86, and on Linux x64 in Ubuntu 24.04 under WSL2 with Xvfb. They checked opening the renderer, all 29 skills, configuration persistence/access mode, media protocol registration, and installation of the bundled Studio plugin into a temporary directory. Only the Linux root test harness used `--no-sandbox`; the shipped application was not changed to disable its sandbox. ARM packages were built and inspected, but were not executed on ARM hardware. Windows installers are unsigned.
+
 Application version: 0.2.1. The 0.2.1 rows below were run on Windows x64 on October 25, 2026. Rows marked "0.2.0" or "0.1.1" were not repeated for 0.2.1.
 
 ## Automated checks
@@ -33,7 +97,7 @@ The application was captured and inspected at 1440 × 960. A compact 1060 × 790
 - Real Roblox Studio place mutations and playtests have not been performed by this verification suite.
 - The Blender integration was exercised on Windows with Blender 4.5 and 5.2, uv 0.11, and `mcp-for-blender` 2.2.4. macOS, Linux, other Blender versions, and the interactive uv installer prompt (the app asks, then runs Astral's official installer) were not exercised. The real server's `generate_3d` and `import_asset` (third-party services and credits) were not run. See [BLENDER.md](BLENDER.md#what-was-verified).
 - Windows ARM64 packages are build targets; their runtime requires verification on ARM64 hardware.
-- Linux x64/ARM64 and legacy x86/ARMv7 require their target build and runtime checks. CI workflows are included but have not been dispatched from this workspace.
+- Linux x64 was subsequently built and smoke-tested under WSL2/Xvfb, and Windows x86 was tested on Windows x64 (see the November 1 build record). Linux ARM64/ARMv7 and Windows ARM64 still require runtime checks on their target hardware. CI workflows are included but have not been dispatched from this workspace.
 - Code signing, publishing, automatic updates, image feedback, and direct filesystem tools are outside this preview.
 
 ## Reproduce

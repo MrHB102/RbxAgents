@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import { abortable } from './async'
 import { extname } from 'node:path'
+import { readFileSync } from 'node:fs'
 import type { Agent, Approval, Effort, MediaItem, McpServer, Message, PlanStep, Provider, RunUsage, Session, Skill, ThreadUsage } from '../shared/types'
 import { SLASH_COMMANDS, parseCommand, parseEffort } from '../shared/commands'
 import { BLENDER_ID } from '../shared/defaults'
@@ -11,7 +13,9 @@ import { instructions, roster } from './prompts'
 import { realWeb, webPage, type WebTools } from './web'
 import { parsePreview, previewOptions, previewScript } from './blender'
 import { SHAREABLE, type MediaStore } from './media'
-import { boundedText, clip, compactTurns, findTools, foldAll, foldHistory, historyTurns, memoryBlock, memoryOf, outputCap, pinPage, skillPageParts, toolResultText, CONTEXT_CHARACTERS } from './context'
+import { boundedText, clip, compactTurns, contextSize, findTools, foldAll, foldHistory, historyTurns, memoryBlock, memoryOf, outputCap, pinPage, skillPageParts, toolResultText, CONTEXT_CHARACTERS } from './context'
+import { ensureBrief, qualityReview, qualityTools, updateBrief, visualRequest } from './quality'
+import { MAX_IMAGE_BYTES, visionImages, type VisionImage } from './vision'
 
 const PALETTE = ['#bd93f9', '#50fa7b', '#8be9fd', '#ffb86c', '#ff79c6', '#f1fa8c']
 const BTW_PROMPT = 'You answer a quick side question (/btw) asked while a task may be in progress. Use only the conversation excerpt and memory below. You have no tools and must not claim to have done or checked anything. If the question needs tool work or would change the task, say so in one line and suggest sending it as a normal message. Reply in the user\'s language, in at most 150 words.'
@@ -24,12 +28,15 @@ interface Participant {
   id?: string; usage?: ThreadUsage; spent: number; busy: boolean
   /** The provider runs its own tool loop (Claude Code), so tool rounds never appear in `turns`. */
   native?: boolean
+  lastReport?: string
 }
 interface Run {
   session: Session; controller: AbortController; signal: AbortSignal; usage: RunUsage; primary: Agent
   threads: Map<string, Participant>; queue: string[]; counter: number
   slots: { free: number; waiting: (() => void)[] }
   webPages: Map<string, { url: string; title: string; text: string; truncated: boolean }>
+  revision: number; observedRevision: number; imageRevision: number; images: VisionImage[]; pendingWrites: number
+  review?: { revision: number; verdict: string }; qualityReminders: number
 }
 
 /** Resolves `/model` arguments: `name`, or `Provider name:model`. Partial names match when unambiguous. */
@@ -91,12 +98,20 @@ export class AgentRuntime {
     this.config(session, agent, true)
     const controller = new AbortController()
     const usage: RunUsage = { tokens: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, requests: 0, contextCharacters: 0, estimated: false, threads: [] }
-    const run: Run = { session, controller, signal: controller.signal, usage, primary: agent, threads: new Map(), queue: [], counter: 0, slots: { free: Math.max(1, this.store.state.settings.maxConcurrent), waiting: [] }, webPages: new Map() }
+    const run: Run = { session, controller, signal: controller.signal, usage, primary: agent, threads: new Map(), queue: [], counter: 0, slots: { free: Math.max(1, this.store.state.settings.maxConcurrent), waiting: [] }, webPages: new Map(), revision: 0, observedRevision: -1, imageRevision: -1, images: [], pendingWrites: 0, qualityReminders: 0 }
     this.runs.set(session.id, run)
     session.lastRun = usage
     session.status = 'running'
     if (!session.messages.some(m => m.role === 'user' && m.kind !== 'btw' && m.kind !== 'command')) session.title = content.slice(0, 65)
     session.messages.push({ id: randomUUID(), role: 'user', content, createdAt: new Date().toISOString() })
+    const existingBrief = session.memory?.brief
+    const brief = ensureBrief(session)
+    if (session.memory?.review) session.memory.review.current = false
+    if (existingBrief) {
+      brief.updates.push(content)
+      if (visualRequest(content)) brief.visual = true
+      while (brief.updates.length > 1 && (brief.updates.length > 8 || brief.updates.join('\n').length > 16_000)) brief.updates.shift()
+    }
     session.updatedAt = new Date().toISOString(); this.store.save()
     void this.execute(run).finally(() => { this.runs.delete(session.id); this.store.save() })
     return { started: true }
@@ -130,9 +145,11 @@ export class AgentRuntime {
       session.messages.push({ id: randomUUID(), role: 'system', content: detail, createdAt: new Date().toISOString() })
       this.store.log(signal.aborted ? 'info' : 'error', `${agent.name} ${signal.aborted ? 'stopped' : 'needs attention'}`, detail, agent.id)
     } finally {
+      // Native providers may return while a tool callback is still running. No worker outlives its run.
+      run.controller.abort()
       // Updates that never reached the model stay in the transcript and join the next run's history.
       for (const message of session.messages) if (message.kind === 'queued') delete message.kind
-      for (const thread of run.threads.values()) if (thread.usage?.status === 'running') thread.usage.status = 'error'
+      for (const thread of run.usage.threads || []) if (thread.status === 'running') thread.status = 'error'
       session.updatedAt = new Date().toISOString()
       for (const approval of this.store.approvals.filter(a => a.sessionId === session.id)) this.decide(approval.id, false)
     }
@@ -146,7 +163,7 @@ export class AgentRuntime {
   private async participant(run: Run, agent: Agent, primary: boolean, history: Turn[]): Promise<Participant> {
     const skills = this.store.state.skills.filter(s => agent.skillIds.includes(s.id))
     for (const id of agent.mcpIds) {
-      await this.mcp.connect(id)
+      await abortable(this.mcp.connect(id), run.signal)
       run.signal.throwIfAborted()
     }
     const servers = this.serverSnapshot(agent.mcpIds)
@@ -161,10 +178,11 @@ export class AgentRuntime {
     if (agent.orchestrator) tools.push(...this.masterTools())
     // Orchestrators delegate research; their workers read the web.
     else if (agent.web !== false) tools.push(...this.webToolSpecs())
+    tools.push(...qualityTools(primary))
     // The primary agent gets the whole memory; a worker only sees the skill pages relevant to it.
     const memory = memoryBlock(run.session, primary ? {} : { skillIds: agent.skillIds, pinsOnly: true })
     const pinned = new Set(memoryOf(run.session).pins.filter(p => primary || agent.skillIds.includes(p.skillId)).map(p => p.key))
-    const turns: Turn[] = [{ role: 'system', content: '' }, ...(memory ? [{ role: 'system' as const, content: memory }] : []), ...history]
+    const turns: Turn[] = [{ role: 'system', content: '' }, { role: 'system', content: memory }, ...history]
     return { agent, primary, turns, tools, skills, servers, memory, pinned, loaded: new Map(), spent: 0, busy: false }
   }
 
@@ -179,10 +197,11 @@ export class AgentRuntime {
       if (p.primary) this.deliverQueue(run, p)
       const cfg = this.config(run, p.agent, p.primary)
       p.turns[0].content = instructions({ global: this.store.state.settings.globalPrompt, agent: p.agent, skills: p.skills, state: this.store.state, worker: !p.primary })
+      p.turns[1].content = memoryBlock(session, p.primary ? {} : { skillIds: p.agent.skillIds, pinsOnly: true })
       p.turns = compactTurns(p.turns, CONTEXT_CHARACTERS - toolCharacters)
-      const context = JSON.stringify(p.turns).length + toolCharacters
+      const context = contextSize(p.turns) + toolCharacters
       if (p.primary) run.usage.contextCharacters = context
-      const estimatedInput = Math.ceil(context / 3)
+      const estimatedInput = Math.ceil(context / 3) + p.turns.reduce((sum, t) => sum + (t.images?.length || 0) * 1500, 0)
       run.usage.requests++
       if (p.usage) p.usage.requests++
       p.native = cfg.provider.kind === 'claude-code'
@@ -193,22 +212,27 @@ export class AgentRuntime {
       let lastEmit = 0
       // Claude Code runs the whole tool loop itself and calls back here for each tool, so rows keep their order in the transcript.
       const execute = p.native ? async (name: string, args: Record<string, unknown>) => {
+        signal.throwIfAborted()
         close()
-        const { output, label, media } = await this.runTool(run, p, { id: randomUUID(), name, arguments: JSON.stringify(args) })
+        const { output, label, media, images } = await this.runTool(run, p, { id: randomUUID(), name, arguments: JSON.stringify(args) })
+        signal.throwIfAborted()
         const bounded = boundedText(output)
         session.messages.push({ id: randomUUID(), role: 'tool', content: `${label}\n${this.store.redact(bounded)}`, createdAt: new Date().toISOString(), ...(p.primary ? {} : { agentId: p.agent.id }), ...(media ? { media } : {}) })
         this.store.save()
         const update = p.primary ? this.takeQueue(run) : ''
-        return update ? `${bounded}\n\n${update}` : bounded
+        const text = update ? `${bounded}\n\n${update}` : bounded
+        return images?.length ? { text, images } : text
       } : undefined
-      const response = await this.providers.turn(cfg.provider, cfg.model, p.turns, p.tools, signal, chunk => {
-        if (!p.primary) return
+      const response = await abortable(this.providers.turn(cfg.provider, cfg.model, p.turns, p.tools, signal, chunk => {
+        if (signal.aborted || !p.primary) return
         open()
         message!.content += this.store.redact(chunk)
         if (Date.now() - lastEmit > 50) { this.store.emit(); lastEmit = Date.now() }
-      }, { maxOutputTokens: outputCap(cfg.effort), effort: cfg.effort, execute })
+      }, { maxOutputTokens: outputCap(cfg.effort), effort: cfg.effort, execute }), signal)
+      signal.throwIfAborted()
       if (response.text) open()
       if (message) message.content = this.store.redact(response.text)
+      const completedMessage = message
       close()
       const used = response.tokens || estimatedInput + Math.ceil(response.text.length / 3) + Math.ceil(JSON.stringify(response.calls).length / 3)
       session.tokens += used; run.usage.tokens += used; p.spent += used
@@ -219,18 +243,25 @@ export class AgentRuntime {
       run.usage.estimated ||= !response.tokens
       last = response.text || last
       if (!response.calls.length) {
-        p.turns.push({ role: 'assistant', content: response.text })
+        p.turns.push({ role: 'assistant', content: response.text, ...(response.responseItems ? { responseItems: response.responseItems } : {}) })
         if (p.primary && run.queue.length) continue
+        if (p.primary && ensureBrief(session).visual && run.revision > 0 && (!ensureBrief(session).acceptance.length || !run.review || run.review.revision !== run.revision || run.review.verdict === 'revise')) {
+          if (completedMessage) completedMessage.content = 'Checking visual acceptance before completing the task…'
+          if (++run.qualityReminders > 2) throw new Error('The visual work ended without a current acceptance review. Its appearance remains unverified; capture the result and assess_quality before claiming completion.')
+          p.turns.push({ role: 'user', content: 'The current visual revision has no accepted quality review. Inspect its actual image, compare each shared acceptance criterion, repair actionable defects and call assess_quality. If evidence or capability is unavailable, record verdict blocked with the concrete limitation and explain the unfinished work.' })
+          continue
+        }
+        if (p.primary && run.review?.verdict === 'blocked') this.note(session, 'Some acceptance criteria remain unverified. The quality review records the blockers; this is not a verified visual pass.')
         return { text: response.text || last, status: 'done' }
       }
-      p.turns.push({ role: 'assistant', content: response.text, tool_calls: response.calls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })), ...(response.thinking ? { thinking: response.thinking } : {}) })
+      p.turns.push({ role: 'assistant', content: response.text, tool_calls: response.calls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })), ...(response.thinking ? { thinking: response.thinking } : {}), ...(response.responseItems ? { responseItems: response.responseItems } : {}) })
       const delegations = p.agent.orchestrator && response.calls.length > 1 && response.calls.every(c => c.name === 'delegate' || c.name === 'send_to_agent')
       const outputs = delegations ? await Promise.all(response.calls.map(c => this.runTool(run, p, c))) : undefined
       for (const [index, call] of response.calls.entries()) {
         signal.throwIfAborted()
-        const { output, label, media } = outputs ? outputs[index] : await this.runTool(run, p, call)
+        const { output, label, media, images } = outputs ? outputs[index] : await this.runTool(run, p, call)
         const bounded = boundedText(output)
-        p.turns.push({ role: 'tool', content: bounded, tool_call_id: call.id })
+        p.turns.push({ role: 'tool', content: bounded, tool_call_id: call.id, ...(images?.length ? { images } : {}) })
         session.messages.push({ id: randomUUID(), role: 'tool', content: `${label}\n${this.store.redact(bounded)}`, createdAt: new Date().toISOString(), ...(p.primary ? {} : { agentId: p.agent.id }), ...(media ? { media } : {}) })
         this.store.save()
       }
@@ -247,6 +278,12 @@ export class AgentRuntime {
     if (!run.queue.length) return ''
     const ids = new Set(run.queue); run.queue = []
     const delivered = run.session.messages.filter(m => ids.has(m.id))
+    const brief = ensureBrief(run.session)
+    brief.updates.push(...delivered.map(m => m.content))
+    if (delivered.some(m => visualRequest(m.content))) brief.visual = true
+    while (brief.updates.length > 1 && (brief.updates.length > 8 || brief.updates.join('\n').length > 16_000)) brief.updates.shift()
+    run.review = undefined
+    if (run.session.memory?.review) run.session.memory.review.current = false
     for (const message of delivered) delete message.kind
     this.store.save()
     return `[User update, sent while you were working]\n${delivered.map(m => m.content).join('\n\n')}`
@@ -262,28 +299,42 @@ export class AgentRuntime {
     return who.primary ? detail.trim() : `${who.agent.name} · ${detail.trim()}`
   }
 
-  private async runTool(run: Run, p: Participant, call: { id: string; name: string; arguments: string }): Promise<{ output: string; label: string; media?: MediaItem[] }> {
+  private async runTool(run: Run, p: Participant, call: { id: string; name: string; arguments: string }): Promise<{ output: string; label: string; media?: MediaItem[]; images?: VisionImage[] }> {
     const { signal } = run
     let args: Record<string, any> = {}
     let output: string
     let media: MediaItem[] | undefined
+    let images: VisionImage[] | undefined
+    let observation = false
     try {
+      signal.throwIfAborted()
       try { args = JSON.parse(call.arguments) } catch { throw new Error('Tool arguments must be valid JSON.') }
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Tool arguments must be a JSON object.')
       if (call.name === 'load_skill') output = this.loadSkill(run, p, args)
       else if (call.name === 'search_tools') {
         if (typeof args.query !== 'string' || args.query.length > 200) throw new Error('Provide a short tool search query.')
         output = JSON.stringify(findTools(p.servers, args.query, p.agent.permission === 'read-only', Number.isSafeInteger(args.limit) ? args.limit : 3))
-      } else if (call.name === 'call_tool') output = await this.callTool(run, p, args)
+      } else if (call.name === 'call_tool') { const result = await this.callTool(run, p, args); output = result.output; images = result.images; observation = result.observation }
+      else if (call.name === 'set_brief' && p.primary) { output = updateBrief(run.session, args); run.review = undefined; if (run.session.memory?.review) run.session.memory.review.current = false; this.store.save() }
+      else if (call.name === 'assess_quality') {
+        const brief = ensureBrief(run.session)
+        const review = qualityReview(args, { changed: run.revision > 0, observed: !run.pendingWrites && run.observedRevision === run.revision, visual: brief.visual, imageObserved: !run.pendingWrites && run.imageRevision === run.revision }, p.primary ? brief.acceptance : [])
+        if (p.primary) { run.review = { revision: run.revision, verdict: review.verdict }; memoryOf(run.session).review = { ...review, current: true }; this.store.save() }
+        output = JSON.stringify(review)
+      }
       else if ((call.name === 'web_search' || call.name === 'web_fetch') && p.tools.some(t => t.name === call.name)) output = await this.webTool(run, p, call.name, args)
-      else if ((call.name === 'render_preview' || call.name === 'share_media') && p.tools.some(t => t.name === call.name)) { const shared = await this.mediaTool(run, p, call.name, args); output = shared.output; media = shared.media }
-      else if (p.agent.orchestrator && ['delegate', 'send_to_agent', 'create_agent', 'update_plan', 'list_agents'].includes(call.name)) output = await this.masterTool(run, p, call.name, args)
+      else if (['render_preview', 'share_media', 'inspect_image'].includes(call.name) && p.tools.some(t => t.name === call.name)) { const shared = await this.mediaTool(run, p, call.name, args); output = shared.output; media = shared.media; images = shared.images }
+      else if (p.agent.orchestrator && ['delegate', 'send_to_agent', 'read_agent_report', 'create_agent', 'update_plan', 'list_agents'].includes(call.name)) output = await this.masterTool(run, p, call.name, args)
       else throw new Error('The model requested an unavailable tool.')
+      if (media?.length && call.name === 'render_preview') { images = media.flatMap(item => this.mediaImage(item)); observation = true }
+      if (images?.length && observation && !run.pendingWrites) { run.images = images; run.imageRevision = run.revision; run.observedRevision = run.revision }
+      if (p.agent.orchestrator && ['delegate', 'send_to_agent'].includes(call.name) && run.imageRevision === run.revision) images = run.images
+      signal.throwIfAborted()
     } catch (e) {
       if (signal.aborted) throw e
       output = JSON.stringify({ error: this.store.redact(error(e)) })
     }
-    return { output, label: this.label(call.name, args, p), ...(media ? { media } : {}) }
+    return { output, label: this.label(call.name, args, p), ...(media ? { media } : {}), ...(images?.length ? { images } : {}) }
   }
 
   private loadSkill(run: Run, p: Participant, args: Record<string, any>) {
@@ -312,12 +363,26 @@ export class AgentRuntime {
     if (!server || !tool) throw new Error('The model requested an unavailable tool.')
     const toolArgs = args.arguments
     if (!toolArgs || typeof toolArgs !== 'object' || Array.isArray(toolArgs)) throw new Error('Tool arguments must be an object.')
+    if (!tool.readOnly && ensureBrief(session).visual && !ensureBrief(session).acceptance.length) throw new Error('Establish the visual work brief and acceptance criteria with set_brief before writing. Workers: ask the Master to set the shared brief, then continue.')
     await this.gate(run, p, server.id, tool.name, toolArgs, tool.readOnly)
-    session.status = 'running'; this.store.save()
-    const result = await this.mcp.call(server.id, tool.name, toolArgs, signal, this.dispatchGuard(agent, tool.readOnly))
+    this.refreshStatus(session); this.store.save()
+    if (!tool.readOnly) { run.pendingWrites++; this.invalidateReview(run) }
+    let result: Awaited<ReturnType<McpManager['call']>>
+    try { result = await abortable(this.mcp.call(server.id, tool.name, toolArgs, signal, this.dispatchGuard(agent, tool.readOnly)), signal) }
+    finally { if (!tool.readOnly) { run.pendingWrites--; this.invalidateReview(run) } }
+    signal.throwIfAborted()
+    if (!result.isError && tool.readOnly && !run.pendingWrites && !['get_connected_instances', 'get_asset_thumbnail', 'get_asset_details', 'preview_asset'].includes(tool.name)) run.observedRevision = run.revision
     const output = toolResultText(result)
     this.store.log('tool', `${agent.name} · ${tool.name}`, output.slice(0, 1000), agent.id)
-    return output
+    return { output, images: visionImages(result), observation: ['capture_screenshot', 'look', 'get_viewport_screenshot'].includes(tool.name) }
+  }
+
+  private invalidateReview(run: Run) { run.revision++; run.images = []; run.review = undefined; if (run.session.memory?.review) run.session.memory.review.current = false }
+
+  private mediaImage(item: MediaItem): VisionImage[] {
+    if (!this.media || item.kind !== 'image' || item.bytes > MAX_IMAGE_BYTES) return []
+    const file = this.media.locate(item.id)
+    return file ? visionImages({ content: [{ type: 'image', mimeType: file.mime, data: readFileSync(file.path).toString('base64') }] }) : []
   }
 
   /** Access mode check for anything that changes something: refuses read-only agents and waits for approval in Ask mode. */
@@ -348,15 +413,30 @@ export class AgentRuntime {
     const enumeration = (values: string[]) => ({ type: 'string', enum: values })
     return [
       { name: 'render_preview', description: "Render a short preview in the user's open Blender and post it in the chat as a playable video (an image for a still). turntable orbits the model once, animation plays the scene's own animation from its first frame, still renders one frame. It frames everything visible (focus 'selected' frames only the selection), uses temporary settings and a temporary camera and light when the scene has none, and puts everything back. Blender is busy while it renders, so keep frames and height small while iterating. Needs approval in Ask mode.", parameters: { type: 'object', properties: { mode: enumeration(['turntable', 'animation', 'still']), frames: { type: 'integer', minimum: 8, maximum: 240 }, height: { type: 'integer', minimum: 240, maximum: 1080 }, engine: enumeration(['eevee', 'workbench', 'scene']), format: enumeration(['mp4', 'webm']), focus: enumeration(['all', 'selected']), caption: { type: 'string', maxLength: 300 } }, additionalProperties: false } },
-      { name: 'share_media', description: `Show an image or video that already exists on this computer in the chat (${SHAREABLE}), for example a render you saved yourself. It is copied into the app and shown to the user; it is not sent anywhere else.`, parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 1000 }, caption: { type: 'string', maxLength: 300 } }, required: ['path'], additionalProperties: false } }
+      { name: 'share_media', description: `Show an image or video that already exists on this computer in the chat (${SHAREABLE}). It is copied into the app and displayed to the user; its pixels are not sent to the model. Returns media_id; use inspect_image explicitly to analyze an image.`, parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 1000 }, caption: { type: 'string', maxLength: 300 } }, required: ['path'], additionalProperties: false } },
+      { name: 'inspect_image', description: 'Send an image already shared in this conversation to the selected model for reference analysis. Use its media_id from share_media. Requires human approval unless access is Unrestricted. Videos need a still view instead.', parameters: { type: 'object', properties: { media_id: { type: 'string' } }, required: ['media_id'], additionalProperties: false } }
     ]
   }
 
-  private async mediaTool(run: Run, p: Participant, name: string, args: Record<string, any>): Promise<{ output: string; media: MediaItem[] }> {
+  private async mediaTool(run: Run, p: Participant, name: string, args: Record<string, any>): Promise<{ output: string; media?: MediaItem[]; images?: VisionImage[] }> {
     const media = this.media
     if (!media) throw new Error('Sharing previews is not available.')
     const caption = typeof args.caption === 'string' ? args.caption : undefined
-    const summary = (item: MediaItem) => ({ shared: true, kind: item.kind, name: item.name, megabytes: Math.round(item.bytes / 1e5) / 10, note: 'The user can now see it in the chat. Describe what it shows only from what you know about the scene.' })
+    const summary = (item: MediaItem) => ({ shared: true, media_id: item.id, kind: item.kind, name: item.name, megabytes: Math.round(item.bytes / 1e5) / 10, note: 'The user can now see it in the chat. Describe appearance only when actual image content was also delivered to you.' })
+    if (name === 'inspect_image') {
+      const item = run.session.messages.flatMap(m => m.media || []).find(item => item.id === args.media_id)
+      if (!item || item.kind !== 'image') throw new Error('Choose an image media_id already shared in this conversation. Videos require a still view.')
+      if (item.bytes > MAX_IMAGE_BYTES) throw new Error('This image is too large for model input. Share a smaller image (at most 4 MB).')
+      if (p.agent.permission !== 'unrestricted') {
+        const cfg = this.config(run, p.agent, p.primary)
+        const approved = await this.approve({ id: randomUUID(), sessionId: run.session.id, agentId: p.agent.id, serverId: 'media', tool: 'inspect_image', kind: 'tool', args: { image: item.name, provider: cfg.provider.name, model: cfg.model, bytes: item.bytes } }, run.signal)
+        if (!approved) throw new Error('The user denied sending this image to the model. Do not retry.')
+      }
+      run.signal.throwIfAborted()
+      const images = this.mediaImage(item)
+      if (!images.length) throw new Error('The stored file is not a supported valid inline image.')
+      return { output: JSON.stringify({ inspected: item.id, name: item.name, note: 'Reference image; this does not prove the current scene matches it.' }), images }
+    }
     if (name === 'share_media') {
       if (typeof args.path !== 'string') throw new Error('Give the full path of the file to share.')
       const item = media.ingest(args.path, { caption })
@@ -367,9 +447,10 @@ export class AgentRuntime {
     const directory = media.scratch()
     try {
       const options = previewOptions(args, directory)
-      run.session.status = 'running'; this.store.save()
+      this.refreshStatus(run.session); this.store.save()
       // Rendering is slow and Blender cannot be interrupted from here, so this call waits up to ten minutes.
-      const result = await this.mcp.call(BLENDER_ID, 'execute_blender_code', { code: previewScript(options) }, run.signal, this.dispatchGuard(p.agent, false), 600_000)
+      const result = await this.mcp.call(BLENDER_ID, 'execute_blender_code', { code: previewScript(options) }, run.signal, this.dispatchGuard(p.agent, false))
+      run.signal.throwIfAborted()
       const text = (Array.isArray(result.content) ? result.content : []).map((part: { type?: string; text?: string }) => part.type === 'text' ? part.text : '').filter(Boolean).join('\n')
       const preview = parsePreview(text)
       if (result.isError || !preview?.file) throw new Error(`Blender did not produce a preview. ${clip(text || 'No output.', 500)}`)
@@ -393,6 +474,7 @@ export class AgentRuntime {
       if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('Give a search query.')
       const limit = Number.isSafeInteger(args.limit) ? args.limit : 5
       const found = await this.web.search(args.query, limit, run.signal, this.store.secret('web:brave') || undefined)
+      run.signal.throwIfAborted()
       this.store.log('tool', `${p.agent.name} · web_search`, args.query, p.agent.id)
       return JSON.stringify({ untrusted_web_content: true, query: args.query, source: found.backend, results: found.results, ...(found.results.length ? {} : { note: 'No results. Try different words.' }) })
     }
@@ -403,6 +485,7 @@ export class AgentRuntime {
     let page = run.webPages.get(args.url)
     if (!page) {
       page = await this.web.fetch(args.url, run.signal)
+      run.signal.throwIfAborted()
       run.webPages.set(args.url, page)
       if (run.webPages.size > 8) run.webPages.delete(run.webPages.keys().next().value!)
       this.store.log('tool', `${p.agent.name} · web_fetch`, page.url, p.agent.id)
@@ -419,6 +502,7 @@ export class AgentRuntime {
       { name: 'update_plan', description: 'Record or update the plan shown to the user and kept in memory across messages. Replaces the whole plan.', parameters: object({ steps: { type: 'array', maxItems: 10, items: object({ id: { type: 'string', maxLength: 20 }, title: { type: 'string', maxLength: 140 }, agent_id: { type: 'string' }, status: { type: 'string', enum: ['pending', 'running', 'done', 'blocked'] } }, ['id', 'title', 'status']) } }, ['steps']) },
       { name: 'delegate', description: 'Start worker threads. Each task needs a self-contained brief; workers cannot see this conversation. Tasks in one call run in parallel. Returns each worker\'s report, thread_id, and token use.', parameters: object({ tasks: { type: 'array', minItems: 1, maxItems: 4, items: object({ agent_id: { type: 'string' }, brief: { type: 'string', maxLength: 6000 }, context: { type: 'string', maxLength: 4000, description: 'Facts the worker needs: instance IDs, paths, constraints, user decisions.' } }, ['agent_id', 'brief']) } }, ['tasks']) },
       { name: 'send_to_agent', description: 'Send a follow-up to a worker thread from this run. The worker keeps its earlier context.', parameters: object({ thread_id: { type: 'string' }, message: { type: 'string', maxLength: 4000 } }, ['thread_id', 'message']) },
+      { name: 'read_agent_report', description: 'Read a full worker report in pages when the delegation summary is truncated. Includes acceptance evidence and unresolved defects omitted from the short summary.', parameters: object({ thread_id: { type: 'string' }, offset: { type: 'integer', minimum: 0 } }, ['thread_id']) },
       { name: 'create_agent', description: 'Propose a new worker agent. The user must approve it every time, even in Unrestricted mode. Use only when no listed worker fits a recurring need.', parameters: object({ name: { type: 'string', maxLength: 60 }, role: { type: 'string', maxLength: 80 }, description: { type: 'string', maxLength: 300 }, system_prompt: { type: 'string', maxLength: 6000 }, skill_ids: { type: 'array', maxItems: 12, items: { type: 'string' } }, permission: { type: 'string', enum: ['ask', 'read-only'] }, based_on: { type: 'string', description: 'Agent id whose provider, model, and Studio connection the new agent copies.' }, reason: { type: 'string', maxLength: 300 } }, ['name', 'role', 'description', 'system_prompt', 'reason']) }
     ]
   }
@@ -436,6 +520,13 @@ export class AgentRuntime {
       return JSON.stringify({ ok: true, done: steps.filter(s => s.status === 'done').length, total: steps.length })
     }
     if (name === 'create_agent') return this.createAgent(run, p, args)
+    if (name === 'read_agent_report') {
+      const thread = run.threads.get(args.thread_id)
+      if (!thread?.lastReport) throw new Error('No completed report for this thread in the current run.')
+      const offset = args.offset ?? 0
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > thread.lastReport.length) throw new Error('Invalid report offset.')
+      return skillPageParts(thread.lastReport, thread.id!, 'worker-report', offset, 4000).json
+    }
     if (name === 'send_to_agent') {
       const thread = typeof args.thread_id === 'string' ? run.threads.get(args.thread_id) : undefined
       if (!thread) throw new Error('Unknown thread_id. Threads only live for the current message; delegate again to start a new one.')
@@ -446,10 +537,21 @@ export class AgentRuntime {
     if (!Array.isArray(args.tasks) || !args.tasks.length || args.tasks.length > 4) throw new Error('Delegate between 1 and 4 tasks per call.')
     const reportLimit = Math.max(1200, Math.floor(5400 / args.tasks.length) - 200)
     const results = await Promise.all(args.tasks.map((task: any) => this.startThread(run, task, reportLimit)))
-    return JSON.stringify(results.length === 1 ? results[0] : results)
+    // Escaped reports can be much larger on the wire. Preserve valid JSON and every thread ID.
+    const reports = results as Record<string, any>[]
+    for (const report of reports) { if (report.error) report.error = boundedText(String(report.error), 500); if (report.partial) report.partial = boundedText(String(report.partial), 800) }
+    const serialized = () => JSON.stringify(reports.length === 1 ? reports[0] : reports)
+    while (serialized().length > 5900) {
+      const largest = reports.filter(r => typeof r.report === 'string' && r.report.length > 200).sort((a, b) => b.report.length - a.report.length)[0]
+      if (!largest) break
+      largest.report = boundedText(largest.report, Math.max(200, Math.floor(largest.report.length / 2)))
+      largest.truncated = true
+    }
+    return serialized()
   }
 
   private async startThread(run: Run, task: { agent_id?: unknown; brief?: unknown; context?: unknown }, reportLimit: number) {
+    if (!task || typeof task !== 'object' || Array.isArray(task)) return { status: 'error', error: 'Each task must be an object with agent_id and brief.' }
     const base = this.store.state.agents.find(a => a.id === task.agent_id)
     if (!base || base.orchestrator) return { error: `Unknown worker "${String(task.agent_id)}". Call list_agents.` }
     if (!base.enabled) return { error: `${base.name} is paused.` }
@@ -459,6 +561,7 @@ export class AgentRuntime {
     const id = `${agent.id}-${++run.counter}`
     const usage: ThreadUsage = { id, agentId: agent.id, agentName: agent.name, model: agent.model, tokens: 0, requests: 0, status: 'running' }
     run.usage.threads = [...(run.usage.threads || []), usage]
+    this.store.emit()
     let thread: Participant
     try { thread = await this.participant(run, agent, false, []) }
     catch (e) { if (run.signal.aborted) throw e; usage.status = 'error'; return { thread_id: id, agent: agent.name, status: 'error', error: this.store.redact(error(e)) } }
@@ -472,20 +575,29 @@ export class AgentRuntime {
     const usage = thread.usage!
     if (thread.busy) return { thread_id: thread.id, agent: thread.agent.name, status: 'error', error: 'This thread is still working.' }
     thread.busy = true
-    await this.slot(run)
-    usage.status = 'running'; this.store.emit()
+    let acquired = false
     const before = thread.spent
     try {
+      await this.slot(run)
+      acquired = true
+      run.signal.throwIfAborted()
+      usage.status = 'running'; this.store.emit()
       thread.turns.push({ role: 'user', content: message })
       const result = await this.converse(run, thread)
+      thread.lastReport = result.text
       usage.status = 'done'
-      return { thread_id: thread.id, agent: thread.agent.name, status: result.status, report: boundedText(result.text || '(The worker returned an empty report.)', reportLimit), tokens: thread.spent - before }
+      return { thread_id: thread.id, agent: thread.agent.name, status: result.status, report: boundedText(result.text || '(The worker returned an empty report.)', reportLimit), truncated: result.text.length > reportLimit, report_characters: result.text.length, tokens: thread.spent - before }
     } catch (e) {
       if (run.signal.aborted) throw e
       usage.status = 'error'
       const lastText = [...thread.turns].reverse().find(t => t.role === 'assistant' && t.content)?.content
       return { thread_id: thread.id, agent: thread.agent.name, status: 'error', error: this.store.redact(error(e)), partial: lastText ? boundedText(lastText, 1500) : undefined, tokens: thread.spent - before }
-    } finally { thread.busy = false; this.release(run); this.store.emit() }
+    } finally {
+      thread.busy = false
+      if (run.signal.aborted) usage.status = 'error'
+      if (acquired) this.release(run)
+      this.store.emit()
+    }
   }
 
   private slot(run: Run) {
@@ -524,11 +636,15 @@ export class AgentRuntime {
     const created: Agent = { id: `${slug}-${randomUUID().slice(0, 4)}`, name, role, description, color: PALETTE[this.store.state.agents.length % PALETTE.length], providerId: base.providerId, model: base.model, systemPrompt, skillIds, mcpIds: [...base.mcpIds], enabled: true, permission, effort: base.effort }
     this.store.state.agents.push(created)
     this.store.log('success', `Agent created: ${name}`, `Proposed by ${p.agent.name}. ${reason}`, created.id)
-    session.status = 'running'; this.store.save()
+    this.refreshStatus(session); this.store.save()
     return JSON.stringify({ created: created.id, name, note: 'The agent is in the roster now. Delegate to it by id.' })
   }
 
   // ---- Approvals ----------------------------------------------------------------------------------------------
+
+  private refreshStatus(session: Session) {
+    session.status = this.store.approvals.some(a => a.sessionId === session.id) ? 'waiting' : 'running'
+  }
 
   private approve(approval: Approval, signal: AbortSignal): Promise<boolean> {
     signal.throwIfAborted()
@@ -538,7 +654,7 @@ export class AgentRuntime {
     this.store.save()
     return new Promise(resolve => {
       const abort = () => this.decide(approval.id, false)
-      this.decisions.set(approval.id, allow => { signal.removeEventListener('abort', abort); if (session && session.status === 'waiting') session.status = 'running'; resolve(allow) })
+      this.decisions.set(approval.id, allow => { signal.removeEventListener('abort', abort); if (session && !signal.aborted) this.refreshStatus(session); resolve(allow) })
       signal.addEventListener('abort', abort, { once: true })
       if (signal.aborted) abort()
     })
@@ -617,7 +733,7 @@ export class AgentRuntime {
           if (running) return this.note(session, `Stop the running task before using /${name}.`)
           const before = memoryOf(session).digest.length
           foldAll(session)
-          if (name === 'clear') { const memory = memoryOf(session); memory.digest = []; memory.pins = []; session.plan = undefined }
+          if (name === 'clear') { const memory = memoryOf(session); memory.digest = []; memory.pins = []; delete memory.brief; delete memory.review; session.plan = undefined }
           return this.note(session, name === 'clear' ? 'Context cleared. The transcript stays visible, but the agent starts fresh.' : `History folded into memory (${memoryOf(session).digest.length - before} new lines). The next message sends the short memory instead of the transcript.`)
         }
       }
@@ -658,10 +774,11 @@ export class AgentRuntime {
       const transcript = session.messages.filter(m => m.kind !== 'btw' && m.kind !== 'command').slice(-10).map(m => `${m.role === 'user' ? 'User' : m.role === 'assistant' ? 'Agent' : m.role === 'tool' ? 'Tool' : 'Note'}: ${clip(m.role === 'tool' ? m.content.split('\n')[0] : m.content, 500)}`).join('\n')
       const turns: Turn[] = [{ role: 'system', content: `${BTW_PROMPT}\n\n${memoryBlock(session, { noPins: true })}\n\n# Recent conversation\n${boundedText(transcript, 5000)}` }, { role: 'user', content: question }]
       let lastEmit = 0
-      const response = await this.providers.turn(cfg.provider, cfg.model, turns, [], controller.signal, chunk => {
+      const response = await abortable(this.providers.turn(cfg.provider, cfg.model, turns, [], controller.signal, chunk => {
+        if (controller.signal.aborted) return
         answer.content += this.store.redact(chunk)
         if (Date.now() - lastEmit > 50) { this.store.emit(); lastEmit = Date.now() }
-      }, { maxOutputTokens: 1024 })
+      }, { maxOutputTokens: 1024, execute: async () => { throw new Error('Side questions have no tools.') } }), controller.signal)
       answer.content = this.store.redact(response.text) || '(no answer)'
       session.tokens += response.tokens || Math.ceil((JSON.stringify(turns).length + response.text.length) / 3)
     } catch (e) {

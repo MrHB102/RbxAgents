@@ -32,7 +32,14 @@ async function fixture(steps: Step[], options: { mode?: string; permission?: Age
   let index = 0
   const turn = vi.fn(async (_provider: unknown, _model: string, _turns: unknown, tools: { name: string }[]) => (steps[index++] ?? say('Done.'))(tools))
   const runtime = new AgentRuntime(store, { turn } as unknown as Providers, mcp, undefined, media)
-  cleanups.push(async () => { runtime.close(); await mcp.close(); rmSync(directory, { recursive: true, force: true }) })
+  cleanups.push(async () => {
+    runtime.close()
+    await vi.waitFor(() => expect(runtime.isRunning('session')).toBe(false), { timeout: 15_000 })
+    // A cancelled run can stop waiting before the shared MCP connection finishes opening.
+    if (server.status === 'connecting') await mcp.connect(server.id).catch(() => {})
+    await mcp.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
   const calls = () => existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : []
   const run = async (message = 'Show me the model.') => { await runtime.send('session', message); await vi.waitFor(() => expect(runtime.isRunning('session')).toBe(false), { timeout: 15_000 }) }
   const toolMessages = () => store.state.sessions[0].messages.filter(m => m.role === 'tool')
@@ -74,7 +81,7 @@ describe('render_preview', () => {
   it('waits for approval, renders, and posts a playable video in the chat', async () => {
     const f = await fixture([call('render_preview', { mode: 'turntable', frames: 12, height: 360, caption: 'Spin' }), say('Here is your preview.')])
     await f.runtime.send('session', 'Show me the model.')
-    await vi.waitFor(() => expect(f.store.approvals).toHaveLength(1))
+    await vi.waitFor(() => expect(f.store.approvals).toHaveLength(1), { timeout: 10_000 })
     expect(f.store.approvals[0]).toMatchObject({ tool: 'render_preview', serverId: 'blender', kind: 'tool' })
     expect(f.calls()).toEqual([])
     f.runtime.decide(f.store.approvals[0].id, true)
@@ -99,7 +106,7 @@ describe('render_preview', () => {
   it('does not render when the user says no', async () => {
     const f = await fixture([call('render_preview', {}), say('Understood.')])
     await f.runtime.send('session', 'Show me the model.')
-    await vi.waitFor(() => expect(f.store.approvals).toHaveLength(1))
+    await vi.waitFor(() => expect(f.store.approvals).toHaveLength(1), { timeout: 10_000 })
     f.runtime.decide(f.store.approvals[0].id, false)
     await vi.waitFor(() => expect(f.runtime.isRunning('session')).toBe(false))
     expect(f.calls()).toEqual([])
@@ -125,6 +132,41 @@ describe('render_preview', () => {
 })
 
 describe('share_media', () => {
+  it('keeps display-only pixels out of model context and requires approval for explicit inspection', async () => {
+    const f = await fixture([], { permission: 'ask' })
+    const path = f.source('reference.png', readFileSync(join(process.cwd(), 'tests/fixtures/preview.png')))
+    let step = 0
+    f.turn.mockImplementation(async (_provider, _model, turns) => {
+      if (step++ === 0) return call('share_media', { path })([])
+      if (step === 2) {
+        const last = (turns as { role: string; content: string }[]).filter(t => t.role === 'tool').at(-1)!
+        return call('inspect_image', { media_id: JSON.parse(last.content).media_id })([])
+      }
+      return say('No image sent.')([])
+    })
+    await f.runtime.send('session', 'Show the reference.')
+    await vi.waitFor(() => expect(f.store.approvals).toHaveLength(1), { timeout: 10_000 })
+    expect(f.store.approvals[0]).toMatchObject({ serverId: 'media', tool: 'inspect_image' })
+    expect(f.turn.mock.calls.flatMap(c => (c[2] as any[]).flatMap(t => t.images || []))).toHaveLength(0)
+    f.runtime.decide(f.store.approvals[0].id, false)
+    await vi.waitFor(() => expect(f.runtime.isRunning('session')).toBe(false))
+    expect(f.toolMessages().at(-1)?.content).toContain('denied sending')
+    expect(f.turn.mock.calls.flatMap(c => (c[2] as any[]).flatMap(t => t.images || []))).toHaveLength(0)
+  })
+  it('delivers an explicitly inspected same-conversation image in Unrestricted mode', async () => {
+    const f = await fixture([], { permission: 'unrestricted' })
+    const path = f.source('reference.png', readFileSync(join(process.cwd(), 'tests/fixtures/preview.png')))
+    let step = 0
+    f.turn.mockImplementation(async (_provider, _model, turns) => {
+      if (step++ === 0) return call('share_media', { path })([])
+      if (step === 2) return call('inspect_image', { media_id: JSON.parse((turns as any[]).filter(t => t.role === 'tool').at(-1).content).media_id })([])
+      expect((turns as any[]).at(-1).images?.[0].mimeType).toBe('image/png')
+      return say('Reference analyzed.')([])
+    })
+    await f.run('Inspect the reference.')
+    expect(f.store.approvals).toHaveLength(0)
+    expect(readFileSync(f.store.path, 'utf8')).not.toContain('data:image/')
+  })
   it('shows an existing image without asking, even to a read-only agent: it changes nothing', async () => {
     const f = await fixture([null as never, say('Done.')], { permission: 'read-only' })
     const path = f.source('render.png', PNG)

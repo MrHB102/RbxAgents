@@ -25,11 +25,16 @@ describe('workspace and credential storage', () => {
       const store = new Store(directory, unavailable)
       store.state.agents[0].name = 'Custom architect'
       store.state.sessions.push({ id: 'session', agentId: 'architect', title: 'Task', messages: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), tokens: 0, status: 'running' })
+      const session = store.state.sessions[0]
+      session.messages.push({ id: 'queued', role: 'user', content: 'Remember this update.', kind: 'queued', createdAt: session.createdAt })
+      session.lastRun = { tokens: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, requests: 0, contextCharacters: 0, estimated: false, threads: [{ id: 'worker-1', agentId: 'scripter', agentName: 'Scripter', model: 'test', tokens: 0, requests: 0, status: 'running' }] }
       store.save()
       const restored = new Store(directory, unavailable)
       expect(restored.state.agents[0].name).toBe('Custom architect')
       expect(restored.state.sessions[0].status).toBe('idle')
-      expect(restored.state.sessions[0].messages[0].content).toContain('interrupted')
+      expect(restored.state.sessions[0].messages.at(-1)?.content).toContain('interrupted')
+      expect(restored.state.sessions[0].messages[0].kind).toBeUndefined()
+      expect(restored.state.sessions[0].lastRun?.threads?.[0].status).toBe('error')
       expect(restored.state.hostId).toBe(store.state.hostId)
     } finally { rmSync(directory, { recursive: true, force: true }) }
   })

@@ -1,6 +1,7 @@
 import type { Agent, AppState, Skill } from '../shared/types'
 import { BLENDER_ID, WORKER_PROTOCOL } from '../shared/defaults'
 import { clip } from './context'
+import { QUALITY_INSTRUCTIONS } from './quality'
 
 export function permissionText(agent: Pick<Agent, 'permission'>) {
   return agent.permission === 'unrestricted'
@@ -29,6 +30,7 @@ export function instructions({ global, agent, skills, state, worker }: Instructi
     agent.mcpIds.includes(BLENDER_ID) && `# Blender\nBlender is the MCP connection "${BLENDER_ID}"; find its tools with search_tools. render_preview and share_media are tools of their own: they post a playable preview or an image straight into the chat, so show results instead of describing them. Rendering keeps Blender busy, so start small and short.`,
     skills.length && `# Available skills (load only what the task needs with load_skill)\n${catalog}`,
     `# Runtime\nsearch_tools finds an MCP tool and its schema; call_tool runs it. Older context may be shortened to save tokens: the Session memory block keeps what mattered.${agent.mcpIds.length ? ` MCP connections: ${agent.mcpIds.join(', ')}.` : ''}`,
-    permissionText(agent)
+    permissionText(agent),
+    QUALITY_INSTRUCTIONS
   ].filter(Boolean).join('\n\n')
 }

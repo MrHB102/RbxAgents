@@ -36,12 +36,16 @@ export interface RunUsage { tokens: number; inputTokens: number; outputTokens: n
 /** A skill page the agent already read. Kept across messages so it is never fetched (or paid for) twice. */
 export interface PinnedPage { key: string; skillId: string; file: string; offset: number; total: number; text: string }
 export interface SessionMemory {
+  /** Original request and structured acceptance contract survive transcript compaction. */
+  brief?: WorkBrief
+  review?: { verdict: 'pass' | 'revise' | 'blocked'; criteria: { criterion: string; status: string; evidence: string }[]; issues: string[]; current: boolean }
   /** One line per folded exchange: request, actions, outcome. Built locally, no model call. */
   digest: string[]
   pins: PinnedPage[]
   /** Id of the last message already folded into the digest. */
   foldedThrough?: string
 }
+export interface WorkBrief { original: string; goal?: string; constraints: string[]; references: string[]; acceptance: string[]; visual: boolean; updates: string[] }
 export interface PlanStep { id: string; title: string; agentId?: string; status: 'pending' | 'running' | 'done' | 'blocked' }
 export interface SessionOverrides { providerId?: string; model?: string; effort?: Effort }
 export interface Session {

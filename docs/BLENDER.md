@@ -29,6 +29,12 @@ If Blender is not found, the add-on is still installed. The message says so and 
 
 To use another port, add `--port 9877` to the connection's arguments and set the same port in Blender's **MCP for Blender** panel (press N in the 3D viewport). The same applies if another Blender MCP add-on already uses 9876.
 
+### Long operations
+
+Blender calls allow 610 seconds for a response, with cancellation still available. For the pinned `uvx mcp-for-blender@2.2.4` connection, RBX Agents launches the same package through a small Python adapter that extends its hardcoded 180-second socket read to 600 seconds. This changes only the launched process; no installed add-on or uv cache files are edited. Other commands and package versions keep their own socket behavior. Render previews use the same policy as other Blender operations.
+
+The app also drains the bridge's stderr so verbose Python logs cannot fill the pipe and block the server. There is no automatic replay of creation commands: a timeout does not prove Blender stopped executing. Inspect the scene before repeating a failed operation. A timeout is per call, not an expiring Blender login or a lifetime limit on the connection.
+
 ## Tools and access modes
 
 | Tool | Access |
@@ -65,7 +71,7 @@ Previews are stored under `media/` in the app's data folder, served to the windo
 - In Ask mode every script is shown to you before it runs. In Unrestricted mode it is not.
 - Save your `.blend` before long agent sessions. A script can change or delete scene data.
 - The downloaded server and add-on are third-party code that runs as your user. Review the project if that matters to you; the version is pinned so it does not change underneath you.
-- `share_media` shows files from your computer in the chat window and keeps a copy in the app's data folder. It sends nothing to a model or the internet. `share_media` needs no approval, so a web page that tricks an agent could make it show an image or video from your computer in the chat. The agent still cannot see or send it, and only the allowed types can be shown.
+- `share_media` displays a local file and keeps a copy in the media folder; it does not send the pixels to a model. `inspect_image` can explicitly send a supported image already shared in that same conversation to the selected provider. It requires approval outside Unrestricted mode and rejects images above 4 MB. Inline images returned by Blender's `look`, and supported generated still previews, are delivered as visual context automatically. Video files require separate still views. These model inputs follow the selected provider's data handling.
 
 ## Troubleshooting
 

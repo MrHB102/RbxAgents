@@ -15,6 +15,23 @@ export const BLENDER_PASSTHROUGH = ['UV_CACHE_DIR', 'UV_TOOL_DIR', 'UV_PYTHON_IN
 /** The server's installer prints arrows and accents. Into a pipe, Python on Windows would use the legacy code page and crash after doing its work. */
 export const BLENDER_PYTHON_ENVIRONMENT = { PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
 
+export const BLENDER_CALL_TIMEOUT = 610_000
+// shortcut: adapt the pinned server's hardcoded 180s socket wait; remove when upstream exposes a timeout setting.
+export const BLENDER_LAUNCHER = `from blender_mcp import server
+class WaitingSocket:
+    def __init__(self, sock):
+        self.sock = sock
+    def __getattr__(self, name):
+        return getattr(self.sock, name)
+    def settimeout(self, seconds):
+        self.sock.settimeout(600.0)
+receive = server.BlenderConnection.receive_full_response
+def receive_full_response(self, sock, buffer_size=8192):
+    return receive(self, WaitingSocket(sock), buffer_size)
+server.BlenderConnection.receive_full_response = receive_full_response
+server.main()
+`
+
 export interface ProcessResult { code: number | null; output: string }
 export function runProcess(command: string, args: string[], options: { env: Record<string, string>; timeout: number; signal?: AbortSignal }): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {

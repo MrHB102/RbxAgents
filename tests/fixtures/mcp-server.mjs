@@ -5,6 +5,7 @@ const server = new McpServer({ name: 'RBX isolated integration fixture', version
 const events = []
 let sequence = 0
 server.registerTool('sequence_probe', { description: 'Prove that Studio actions do not overlap.', inputSchema: {} }, async () => {
+  if (process.env.MCP_FIXTURE_STDERR) await new Promise(resolve => process.stderr.write('x'.repeat(2 * 1024 * 1024), resolve))
   const current = ++sequence
   events.push(`start:${current}`)
   await new Promise(resolve => setTimeout(resolve, 40))

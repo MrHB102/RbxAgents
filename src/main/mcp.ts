@@ -1,16 +1,18 @@
 import { createRequire } from 'node:module'
+import { abortable } from './async'
 import { spawn } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 import type { Store } from './store'
 import type { McpServer } from '../shared/types'
 import { validateEndpoint } from './http'
-import { BLENDER_ID } from '../shared/defaults'
-import { BLENDER_HIDDEN_TOOLS, BLENDER_PASSTHROUGH, BLENDER_PYTHON_ENVIRONMENT, BLENDER_READ_TOOLS, blenderEndpoint, findUvx, installBlender, probe } from './blender'
+import { BLENDER_ID, BLENDER_PACKAGE } from '../shared/defaults'
+import { BLENDER_CALL_TIMEOUT, BLENDER_LAUNCHER, BLENDER_HIDDEN_TOOLS, BLENDER_PASSTHROUGH, BLENDER_PYTHON_ENVIRONMENT, BLENDER_READ_TOOLS, blenderEndpoint, findUvx, installBlender, probe } from './blender'
 
-export const READ_TOOLS = new Set(['get_connected_instances', 'get_studio_state', 'get_game_info', 'get_project_structure', 'get_instance_properties', 'get_instance_children', 'get_script_source', 'get_runtime_logs', 'get_console_output', 'search_game_tree', 'search_files', 'search_objects', 'script_read', 'script_search', 'script_grep', 'get_roblox_docs', 'get_roblox_skills', 'get_asset_details', 'selection_get'])
+export const READ_TOOLS = new Set(['get_connected_instances', 'get_studio_state', 'get_game_info', 'get_project_structure', 'get_instance_properties', 'get_instance_children', 'get_script_source', 'get_runtime_logs', 'get_console_output', 'search_game_tree', 'search_files', 'search_objects', 'script_read', 'script_search', 'script_grep', 'get_roblox_docs', 'get_roblox_skills', 'get_asset_details', 'selection_get', 'capture_screenshot', 'get_asset_thumbnail', 'preview_asset', 'get_scene_analysis', 'inspect_ui'])
 const mcpRequire = createRequire(import.meta.url)
 export function bundledMcpPath() { return mcpRequire.resolve('@chrrxs/robloxstudio-mcp').replace(/app\.asar([\\/])/, 'app.asar.unpacked$1') }
 export function childEnvironment(extra: Record<string, string> = {}) {
@@ -57,13 +59,17 @@ export class McpManager {
         command = (this.hooks.uvx ?? findUvx)() || ''
         if (!command) throw new Error('The Blender connection needs uv, which is not installed yet. Open MCP bridges and select Install Blender add-on.')
       }
-      transport = new StdioClientTransport({ command, args: server.args, env: blender ? this.blenderEnvironment(server) : childEnvironment(server.env), stderr: 'pipe' })
+      const args = blender && /(?:^|[\\/])uvx(?:\.exe)?$/i.test(command) && server.args[0] === BLENDER_PACKAGE
+        ? ['--from', BLENDER_PACKAGE, 'python', '-c', BLENDER_LAUNCHER, ...server.args.slice(1)] : server.args
+      transport = new StdioClientTransport({ command, args, env: blender ? this.blenderEnvironment(server) : childEnvironment(server.env), stderr: 'pipe' })
     } else {
       const url = new URL(validateEndpoint(server.url))
       const token = this.store.secret(`mcp:${id}`)
       const options = token ? { requestInit: { headers: { Authorization: `Bearer ${token}` } } } : {}
       transport = server.transport === 'sse' ? new SSEClientTransport(url, options) : new StreamableHTTPClientTransport(url, options)
     }
+    // Python logs every command to stderr; an unread pipe eventually blocks the bridge.
+    if (transport instanceof StdioClientTransport) transport.stderr?.on('data', () => {})
     client.onclose = () => {
       if (this.clients.get(id) === client) { this.clients.delete(id); server.status = 'disconnected'; server.tools = []; this.store.save() }
     }
@@ -102,7 +108,7 @@ export class McpManager {
     if (!server) throw new Error('MCP server not found.')
     return server
   }
-  async call(id: string, name: string, args: Record<string, unknown>, signal?: AbortSignal, guard?: () => void, timeout = 120_000) {
+  async call(id: string, name: string, args: Record<string, unknown>, signal?: AbortSignal, guard?: () => void, timeout = id === BLENDER_ID ? BLENDER_CALL_TIMEOUT : 120_000) {
     // Serialize calls across agents to prevent interleaved mutations in one Studio.
     const previous = this.queues.get(id) || Promise.resolve()
     const pending = previous.catch(() => {}).then(async () => {
@@ -112,10 +118,21 @@ export class McpManager {
       const client = this.clients.get(id)
       if (!client) throw new Error('MCP bridge disconnected.')
       guard?.()
-      return client.callTool({ name, arguments: args }, undefined, { timeout, signal })
+      try {
+        return await client.callTool({ name, arguments: args }, undefined, { timeout, signal })
+      } catch (error) {
+        if (id === BLENDER_ID && error instanceof McpError && error.code === ErrorCode.RequestTimeout) {
+          throw new Error(`Blender did not respond within ${Math.round(timeout / 1000)} seconds. The command may still be running in Blender. Do not repeat creation commands: wait for Blender, then inspect the scene before continuing.`, { cause: error })
+        }
+        throw error
+      }
     })
     this.queues.set(id, pending)
-    try { return await pending } finally { if (this.queues.get(id) === pending) this.queues.delete(id) }
+    // A cancelled waiter returns immediately, but its queue entry must keep its place until
+    // the preceding action finishes; removing it early would allow later mutations to overlap.
+    const cleanup = () => { if (this.queues.get(id) === pending) this.queues.delete(id) }
+    void pending.then(cleanup, cleanup)
+    return signal ? abortable(pending, signal) : pending
   }
   async install(id: string) {
     const server = this.server(id)

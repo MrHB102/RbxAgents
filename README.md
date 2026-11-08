@@ -79,8 +79,9 @@ Economy context handling is on by default, including for existing agents:
 - All 29 skills remain installed. Skill instructions and references are loaded in pages of up to 5,000 characters. **Pages an agent has read are remembered for the whole conversation** (up to 9,000 characters, oldest evicted first) and shared with the workers that have the skill, so they are neither fetched nor re-paid for on every message.
 - **Session memory replaces the old "forget on the next message" behavior.** The last three exchanges are sent verbatim. Older ones are folded locally into one line each (request, actions, result), together with a short list of recent actions and the current plan. No model call is used to summarize. `/compact` and `/clear` control this by hand.
 - **Prompt caching.** For Anthropic models the app marks tools, system blocks, and the newest message as cacheable, so every step of a run re-reads its prefix at the cached price. Instructions are kept byte-stable between steps. OpenAI caches stable prefixes on its own; other OpenAI-compatible servers vary.
-- Tool results are capped at 6,000 characters. Binary image/audio output is omitted from text context.
-- Serialized model context and tool definitions are limited to 48,000 characters per request (the memory block is part of it). Old tool rounds are removed locally when needed. The current user request is preserved; oversized instructions fail before inference.
+- Tool text results are capped at 6,000 characters. Supported inline tool images are sent separately to vision-capable models; their base64 is excluded from textual logs and workspace JSON. Up to two images per result (4 MB each) and four recent images in model context are retained. Images add provider token usage.
+- Serialized text context and tool definitions are limited to 96,000 characters per request. The original request, structured work brief, references, acceptance criteria and recent user updates survive transcript compaction and are shared with workers. Old tool rounds are removed locally when needed; oversized instructions fail before inference.
+- Visual work uses `set_brief` and `assess_quality`: a pass requires current image evidence and every acceptance criterion, and later changes invalidate it. Missing capabilities can be recorded as blocked. The runtime prevents an unreviewed visual mutation from silently becoming a completed task. These checks organize evidence; they do not guarantee artistic quality.
 - **There are no per-message limits.** An agent works until it stops calling tools or you press **Stop**: no step limit, token budget, or request cap, for agents, a Master's workers, web access, or Claude Code. Stop ends everything, including workers and pending approvals. Watch the inspector's token counts while a long task runs, because a model that keeps calling tools will keep spending your provider's tokens.
 - Each response is capped at 4,096 output tokens by default, because provider APIs require a cap. A higher `/effort` raises it (medium 8,192, high 12,000, xhigh/max 24,000) because reasoning uses output tokens.
 - The conversation inspector separates **Conversation tokens**, **Last run tokens**, model request count, approximate context size, and cached input. Cached input is part of the reported input total, not an extra charge added by the app. Estimates are labeled when provider usage is unavailable.
@@ -249,6 +250,7 @@ npm run typecheck
 npm test
 npm run verify:skills
 npm run test:e2e
+npm run test:headless:linux # Linux/WSL with Node.js, Electron dependencies and Xvfb
 npm run test:package # After creating a Windows x64 package
 npm run build
 npm audit
@@ -291,8 +293,8 @@ Independent agent conversations can run concurrently. Each uses a snapshot of it
 ## Current limitations
 
 - Live ChatGPT OAuth, live Anthropic API inference, and real Studio place edits require the user’s account and Studio connection; fixture tests do not establish those external services’ availability.
-- Agents can show you previews, but they cannot see them: images from Blender's `look` tool are left out of the text sent to the model, and you cannot attach images to a message. Multimodal screenshot feedback is not implemented.
-- The Master Agent delegates within one message: worker threads live for that message, and a worker cannot see the conversation or other workers. Workers do not run in the background after the Master answers, and there is no shared task board between conversations.
+- Image feedback requires an image-capable model and a tool that returns supported inline pixels. Videos are not analyzed as frames; obtain still views. The composer does not yet accept image attachments. Local `share_media` stays display-only; `inspect_image` explicitly sends a same-conversation image to the selected model, with approval outside Unrestricted mode.
+- The Master Agent delegates within one message: worker threads live for that message and inherit the shared brief, not the full conversation or other workers' transcripts. Current scene images reach the Master, and `read_agent_report` retrieves report details omitted from delegation summaries. Workers do not run in the background after the Master answers.
 - The project folder setting labels your workspace. Direct project filesystem tools, terminal access, and Rojo synchronization are not implemented; Studio access goes through MCP.
 - MCP OAuth discovery, automatic skill updates, configuration import, automatic application updates, and signed releases are not implemented.
 - The app serializes its own Studio calls. It cannot coordinate external MCP clients or manual Studio edits made at the same time.

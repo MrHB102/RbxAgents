@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { createServer, type Server as HttpServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
@@ -8,8 +9,10 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import type { Effort } from '../shared/types'
-import type { ToolSpec, Turn } from './providers'
+import type { NativeToolOutput, ToolSpec, Turn } from './providers'
+import { anthropicImage } from './vision'
 import { boundedText } from './context'
+import { abortable } from './async'
 
 /**
  * Claude Code as a model provider.
@@ -27,7 +30,7 @@ export interface ClaudeTurnInput {
   executable: string; model: string; effort?: Effort; turns: Turn[]; tools: ToolSpec[]; signal: AbortSignal
   onText: (text: string) => void
   /** Runs one tool call requested by Claude Code and returns its result text. May throw to report an error. */
-  execute: (name: string, args: Record<string, unknown>) => Promise<string>
+  execute: (name: string, args: Record<string, unknown>) => Promise<NativeToolOutput>
 }
 export interface ClaudeTurnResult { text: string; tokens: number; usage: { inputTokens: number; outputTokens: number; cachedInputTokens: number } }
 
@@ -85,7 +88,7 @@ export function renderPrompt(turns: Turn[]) {
 }
 
 export class ClaudeCode {
-  constructor(private resolve: (hint: string) => Launcher = locateClaude) {}
+  constructor(private resolve: (hint: string) => Launcher = locateClaude, private inactivityMs = 120_000) {}
 
   async status(hint: string): Promise<ClaudeStatus> {
     const launcher = this.resolve(hint)
@@ -107,13 +110,24 @@ export class ClaudeCode {
   }
 
   async turn(input: ClaudeTurnInput): Promise<ClaudeTurnResult> {
-    const { signal } = input
+    const lifetime = new AbortController()
+    const signal = AbortSignal.any([input.signal, lifetime.signal])
     signal.throwIfAborted()
     const launcher = this.resolve(input.executable)
     const directory = mkdtempSync(join(tmpdir(), 'rbx-claude-'))
     const token = randomBytes(24).toString('hex')
     let child: ChildProcess | undefined
     let bridge: HttpServer | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let linger: ReturnType<typeof setTimeout> | undefined
+    let activeTools = 0
+    const abort = () => { if (child) killTree(child) }
+    // Delegation, renders, and human approvals may take arbitrarily long. Only idle inference times out.
+    const touch = () => {
+      clearTimeout(timer)
+      if (!activeTools && !signal.aborted) timer = setTimeout(() => lifetime.abort(new Error('Claude Code stopped responding. Retry the task or check the provider connection.')), this.inactivityMs)
+    }
+    signal.addEventListener('abort', abort, { once: true })
     try {
       bridge = createServer(async (req, res) => {
         // Only the Claude Code process started for this turn knows the token.
@@ -122,11 +136,19 @@ export class ClaudeCode {
         for await (const chunk of req) body += chunk
         const server = new Server({ name: 'rbx', version: '1.0.0' }, { capabilities: { tools: {} } })
         server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: input.tools.map(t => ({ name: t.name, description: t.description, inputSchema: t.parameters as { type: 'object' } })) }))
-        server.setRequestHandler(CallToolRequestSchema, async request => {
+        server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+          activeTools++; clearTimeout(timer)
+          const disconnected = () => lifetime.abort(new Error('Claude Code disconnected while waiting for a tool result. Retry the task.'))
+          extra.signal.addEventListener('abort', disconnected, { once: true })
           try {
+            if (extra.signal.aborted) disconnected()
+            signal.throwIfAborted()
             const args = request.params.arguments && typeof request.params.arguments === 'object' ? request.params.arguments : {}
-            return { content: [{ type: 'text' as const, text: await input.execute(request.params.name, args) }] }
+            const result = await abortable(input.execute(request.params.name, args), signal)
+            const output = typeof result === 'string' ? { text: result } : result
+            return { content: [{ type: 'text' as const, text: output.text }, ...(output.images || []).map(image => ({ type: 'image' as const, mimeType: image.mimeType, data: image.data }))] }
           } catch (error) { return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }] } }
+          finally { extra.signal.removeEventListener('abort', disconnected); activeTools--; touch() }
         })
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
         res.on('close', () => { void transport.close(); void server.close() })
@@ -134,20 +156,22 @@ export class ClaudeCode {
         catch { if (!res.headersSent) res.writeHead(400).end() }
       })
       await new Promise<void>((resolve, reject) => { bridge!.once('error', reject); bridge!.listen(0, '127.0.0.1', resolve) })
+      signal.throwIfAborted()
       const port = (bridge.address() as { port: number }).port
       const system = join(directory, 'system.md')
       const config = join(directory, 'mcp.json')
       writeFileSync(system, input.turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'))
       writeFileSync(config, JSON.stringify({ mcpServers: { rbx: { type: 'http', url: `http://127.0.0.1:${port}/mcp`, headers: { Authorization: `Bearer ${token}` } } } }))
-      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', input.model,
+      const images = input.turns.flatMap(t => t.images || [])
+      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', ...(images.length ? ['--input-format', 'stream-json'] : []), '--model', input.model,
         '--system-prompt-file', system, '--tools', '', '--strict-mcp-config', '--mcp-config', config, '--allowedTools', 'mcp__rbx__*',
         '--permission-mode', 'dontAsk', '--disable-slash-commands', '--no-session-persistence', '--setting-sources', 'project', ...(input.effort ? ['--effort', input.effort] : [])]
       // An empty working folder keeps project settings, memory files, and hooks from reaching the run.
       child = spawn(launcher.command, [...launcher.args, ...args], { cwd: directory, env: environment(), windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] })
-      const abort = () => child && killTree(child)
-      signal.addEventListener('abort', abort, { once: true })
+      touch()
       child.stdin!.on('error', () => {})
-      child.stdin!.end(renderPrompt(input.turns))
+      const prompt = renderPrompt(input.turns)
+      child.stdin!.end(images.length ? JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: prompt }, ...images.map(anthropicImage)] } }) + '\n' : prompt)
       let stderr = ''
       child.stderr!.on('data', chunk => { stderr = (stderr + chunk).slice(-4000) })
       let text = ''
@@ -160,16 +184,18 @@ export class ClaudeCode {
         else if (event.type === 'result') {
           final = event; text = typeof event.result === 'string' ? event.result : text
           // The answer is complete; do not wait on a process that lingers.
-          setTimeout(() => child && killTree(child), 5000).unref()
+          linger = setTimeout(() => child && killTree(child), 5000)
+          linger.unref()
         }
       }
       child.stdout!.on('data', chunk => {
+        if (signal.aborted) return
+        touch()
         buffer += chunk
         let index: number
         while ((index = buffer.indexOf('\n')) >= 0) { handle(buffer.slice(0, index)); buffer = buffer.slice(index + 1) }
       })
-      const code = await new Promise<number | null>((resolve, reject) => { child!.once('error', reject); child!.once('close', resolve) })
-      signal.removeEventListener('abort', abort)
+      const code = await abortable(new Promise<number | null>((resolve, reject) => { child!.once('error', reject); child!.once('close', resolve) }), signal)
       if (buffer.trim()) handle(buffer)
       signal.throwIfAborted()
       if (!final) throw new Error(`Claude Code stopped without an answer${code ? ` (exit ${code})` : ''}. ${boundedText(stderr.trim(), 400)}`.trim())
@@ -182,9 +208,13 @@ export class ClaudeCode {
       const inputTokens = (u.input_tokens || 0) + cached + (u.cache_creation_input_tokens || 0)
       return { text, tokens: inputTokens + (u.output_tokens || 0), usage: { inputTokens, outputTokens: u.output_tokens || 0, cachedInputTokens: cached } }
     } finally {
+      clearTimeout(timer); clearTimeout(linger)
+      lifetime.abort()
+      signal.removeEventListener('abort', abort)
       if (child) killTree(child)
       bridge?.close(); bridge?.closeAllConnections?.()
-      rmSync(directory, { recursive: true, force: true })
+      // taskkill finishes asynchronously; Windows may still hold the process's working folder.
+      await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
     }
   }
 }

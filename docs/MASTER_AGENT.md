@@ -44,5 +44,6 @@ The Master can call `create_agent` when no worker fits a recurring need. This **
 ## Limits
 
 - Up to four tasks per `delegate` call. At most your **Concurrent agents** setting run at once; the rest wait.
-- A worker report is capped at roughly 5,400 characters across a delegate call; workers are told to keep reports under 250 words.
-- Quality depends on briefs. Workers cannot see the conversation, so the Master is instructed to include instance IDs, paths, constraints, and your decisions in each brief.
+- Delegation summaries are bounded to roughly 5,900 serialized characters across a call; every thread ID remains available. Workers retain their full reports for `read_agent_report` paging during that run. There is no 250-word report instruction.
+- Workers inherit the persistent shared brief: the original request, goal, constraints, references, acceptance criteria and recent user updates. The Master still supplies task-specific instance IDs and paths. Current scene images are delivered separately to the Master for visual acceptance; reference images alone cannot pass a scene review.
+- A visual pass requires all acceptance criteria and image evidence after the latest mutation. Pending writes and later mutations invalidate earlier observations. A blocked review keeps missing evidence and issues visible in session memory. This is evidence tracking, not an objective aesthetic score.

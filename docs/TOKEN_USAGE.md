@@ -1,5 +1,15 @@
 # Token usage and context
 
+## November 2026: visual evidence and durable work briefs
+
+The text context ceiling is now 96,000 characters. The original request, structured brief, recent user updates and acceptance review survive transcript folding and are shared with delegated workers. The last three exchanges still remain verbatim; `/clear` resets the brief and review as well as the digest.
+
+Supported tool images are passed as image content rather than serialized into text. Each result accepts up to two images of 4 MB each; model context retains at most four recent comparison images. Pixels stay out of textual logs and workspace JSON. Actual provider usage is preferred; when unavailable, image input is estimated at 1,500 tokens per image, and the existing context meter represents text only. Costs depend on the provider and image encoding, so this estimate is not a billing prediction.
+
+GPT-6 effort levels are transmitted without collapsing xhigh/max to high. Official GPT-6 tool requests use Responses; replayable output items, encrypted reasoning and assistant phase are preserved within the active run. Worker reports can be read in pages rather than losing details when their summary is shortened.
+
+These changes allow more context and visual review, and can increase usage. There is still no per-message tool-loop or token budget; Stop cancels the run.
+
 ## 0.1.1: economy context
 
 The previous runtime resent every connected MCP tool definition on each model step, allowed tool results as large as 120,000 characters, and retained up to roughly 1.5 million characters of request context. The displayed token counter accumulated every model step across the conversation.

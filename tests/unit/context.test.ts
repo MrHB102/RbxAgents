@@ -6,7 +6,7 @@ import { initialState } from '../../src/shared/defaults'
 describe('economy context', () => {
   it('keeps the latest user request while removing old conversation exchanges', () => {
     const turns: Turn[] = [{ role: 'system', content: 'Instructions' }, { role: 'user', content: 'old '.repeat(20_000) }, { role: 'assistant', content: 'old answer' }, { role: 'user', content: 'Current task' }]
-    const result = compactTurns(turns)
+    const result = compactTurns(turns, 48_000)
     expect(result[0]).toEqual(turns[0])
     expect(result.at(-1)).toEqual(turns[3])
     expect(result[1].content).toContain('Earlier task excerpt')
@@ -15,13 +15,13 @@ describe('economy context', () => {
   })
   it('removes complete old tool rounds without leaving orphan tool results', () => {
     const turns: Turn[] = [{ role: 'system', content: 'Instructions' }, { role: 'user', content: 'Current task' }, { role: 'assistant', content: '', tool_calls: [{ id: 'old', type: 'function', function: { name: 'call_tool', arguments: '{}' } }] }, { role: 'tool', tool_call_id: 'old', content: 'old output '.repeat(8000) }, { role: 'assistant', content: '', tool_calls: [{ id: 'recent', type: 'function', function: { name: 'call_tool', arguments: '{}' } }] }, { role: 'tool', tool_call_id: 'recent', content: 'Current result' }]
-    const result = compactTurns(turns)
+    const result = compactTurns(turns, 48_000)
     expect(result.some(t => t.tool_call_id === 'old')).toBe(false)
     expect(result.some(t => t.tool_call_id === 'recent')).toBe(true)
     expect(JSON.stringify(result).length).toBeLessThan(36_000)
   })
   it('does not shorten the current task or silently drop oversized instructions', () => {
-    expect(() => compactTurns([{ role: 'system', content: 'x'.repeat(60_000) }, { role: 'user', content: 'Current task' }])).toThrow('Shorten')
+    expect(() => compactTurns([{ role: 'system', content: 'x'.repeat(120_000) }, { role: 'user', content: 'Current task' }])).toThrow('Shorten')
     expect(boundedText('x'.repeat(120_000)).length).toBeLessThanOrEqual(6000)
   })
   it('finds tools on demand and filters writes from read-only discovery', () => {

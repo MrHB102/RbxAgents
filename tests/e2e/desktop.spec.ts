@@ -13,7 +13,9 @@ let requests: Record<string, any>[] = []
 let addon: SocketServer
 let addonPort = 0
 let fakeBin: string
+let qualityPrematureFinish = false
 const fixture = (name: string) => join(process.cwd(), 'tests', 'fixtures', name)
+const launchArgs = () => process.platform === 'linux' && process.getuid?.() === 0 ? ['--no-sandbox', '.'] : ['.']
 
 /** The app under test never touches the real uv or Blender: a copy of Node named uvx comes first on PATH. */
 function appEnvironment() {
@@ -37,9 +39,20 @@ test.beforeAll(async () => {
       const payload = JSON.parse(body); requests.push(payload)
       res.writeHead(200, { 'Content-Type': 'text/event-stream' })
       const event = (value: unknown) => res.write(`data: ${JSON.stringify(value)}\n\n`)
-      const shares = [{ name: 'render_preview', args: { mode: 'turntable', frames: 12, height: 240, caption: 'Test double render' } }, { name: 'share_media', args: { path: fixture('preview.mp4'), caption: 'Real mp4' } }, { name: 'share_media', args: { path: fixture('preview.webm'), caption: 'Real webm' } }, { name: 'share_media', args: { path: fixture('preview.png'), caption: 'Real png' } }]
+      const shares = [{ name: 'call_tool', args: { server_id: 'blender', name: 'look', arguments: {} } }, { name: 'render_preview', args: { mode: 'turntable', frames: 12, height: 240, caption: 'Test double render' } }, { name: 'share_media', args: { path: fixture('preview.mp4'), caption: 'Real mp4' } }, { name: 'share_media', args: { path: fixture('preview.webm'), caption: 'Real webm' } }, { name: 'share_media', args: { path: fixture('preview.png'), caption: 'Real png' } }]
       const finished = payload.messages.filter((message: any) => message.role === 'tool').length
-      if (payload.tools?.some((tool: any) => tool.function.name === 'render_preview')) {
+      if (payload.messages.some((message: any) => message.role === 'user' && typeof message.content === 'string' && message.content.includes('HEADLESS_VISUAL'))) {
+        const review = { name: 'assess_quality', args: { verdict: 'pass', criteria: [{ criterion: 'Blue model', status: 'pass', evidence: 'Fresh look image from the current revision.' }], issues: [] } }
+        const write = { name: 'call_tool', args: { server_id: 'blender', name: 'execute_blender_code', arguments: { code: 'print("HEADLESS_BLUE_MODEL")' } } }
+        const look = { name: 'call_tool', args: { server_id: 'blender', name: 'look', arguments: {} } }
+        const steps = [{ name: 'set_brief', args: { goal: 'Blue model', constraints: ['Keep existing assets'], references: ['Fixture view'], acceptance: ['Blue model'], visual: true } }, write, look, review, write, look, review]
+        if (finished === 5 && !qualityPrematureFinish) {
+          qualityPrematureFinish = true
+          event({ choices: [{ delta: { content: 'Finished without fresh evidence.' }, finish_reason: 'stop' }] })
+        } else if (finished < steps.length) {
+          event({ choices: [{ delta: { tool_calls: [{ index: 0, id: `quality-${finished}`, function: { name: steps[finished].name, arguments: JSON.stringify(steps[finished].args) } }] }, finish_reason: 'tool_calls' }] })
+        } else event({ choices: [{ delta: { content: 'Visual review completed after the final revision.' }, finish_reason: 'stop' }] })
+      } else if (payload.tools?.some((tool: any) => tool.function.name === 'render_preview')) {
         if (finished < shares.length) {
           event({ choices: [{ delta: { tool_calls: [{ index: 0, id: `call_share_${finished}`, function: { name: shares[finished].name, arguments: JSON.stringify(shares[finished].args) } }] } }] })
           event({ choices: [{ delta: {}, finish_reason: 'tool_calls' }], usage: { total_tokens: 25 } })
@@ -61,8 +74,9 @@ test.beforeAll(async () => {
   await new Promise<void>(resolve => api.listen(0, '127.0.0.1', resolve))
   const address = api.address() as { port: number }
   apiUrl = `http://127.0.0.1:${address.port}/v1`
-  desktop = await electron.launch({ args: ['.'], cwd: process.cwd(), env: appEnvironment() })
+  desktop = await electron.launch({ args: launchArgs(), cwd: process.cwd(), env: appEnvironment() })
 })
+
 test.afterAll(async () => { await desktop?.close(); await new Promise<void>(resolve => api?.close(() => resolve())); await new Promise<void>(resolve => addon?.close(() => resolve())) })
 
 test('desktop onboarding, complete bundled library, real provider loop, persistence, and plugin installation', async () => {
@@ -118,7 +132,7 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   await expect(page.locator('.tool-message')).toContainText('load_skill')
   expect(requests).toHaveLength(2)
   expect(requests[0].max_tokens).toBeLessThanOrEqual(4096)
-  expect(requests[0].tools.map((tool: any) => tool.function.name)).toEqual(['load_skill', 'web_search', 'web_fetch'])
+  expect(requests[0].tools.map((tool: any) => tool.function.name)).toEqual(['load_skill', 'web_search', 'web_fetch', 'set_brief', 'assess_quality'])
   expect(requests[0].messages[0].content).toContain('server')
   expect(requests[1].messages.some((m: any) => m.role === 'tool' && m.content.includes('Architecture'))).toBe(true)
   // Slash commands: suggestions appear, and commands never reach the model.
@@ -162,7 +176,7 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   expect(errors).toEqual([])
   // Read persisted state after a restart with the same test profile.
   await desktop.close()
-  desktop = await electron.launch({ args: ['.'], cwd: process.cwd(), env: appEnvironment() })
+  desktop = await electron.launch({ args: launchArgs(), cwd: process.cwd(), env: appEnvironment() })
   const restored = await desktop.firstWindow()
   await expect(restored.locator('.agent-card').filter({ has: restored.getByRole('heading', { name: 'Architect', exact: true }) })).toContainText('test-roblox-model')
   await restored.getByRole('button', { name: 'Conversations', exact: true }).click()
@@ -217,6 +231,7 @@ test('Blender: one-click install, a connected bridge, and previews that play in 
   await expect(page.locator('.media-card')).toHaveCount(4)
   await expect(page.locator('.media-card video')).toHaveCount(3)
   await expect(page.locator('.media-card img')).toHaveCount(1)
+  expect(requests.some(request => request.messages.some((message: any) => message.role === 'user' && Array.isArray(message.content) && message.content.some((part: any) => part.type === 'image_url' && part.image_url.url.startsWith('data:image/png;base64,'))))).toBe(true)
   await expect(page.locator('.media-card').nth(1)).toContainText('Real mp4')
   // What Blender renders has to actually play inside the app, not just be listed.
   const state = await page.evaluate(async () => {
@@ -238,4 +253,24 @@ test('Blender: one-click install, a connected bridge, and previews that play in 
   expect(statSync(join(data, 'workspace.json')).size).toBeLessThan(200_000)
   expect(readdirSync(join(data, 'media')).filter(name => /\.(mp4|webm|png)$/.test(name))).toHaveLength(4)
   expect(errors).toEqual([])
+})
+
+test('visual acceptance stays active after a later mutation and requires fresh image evidence', async () => {
+  const page = await desktop.firstWindow()
+  requests = []; qualityPrematureFinish = false
+  await page.getByRole('navigation').getByRole('button', { name: /^Agents/ }).click()
+  await page.locator('.agent-card').filter({ has: page.getByRole('heading', { name: 'Artist', exact: true }) }).getByRole('button', { name: 'Start chat' }).click()
+  await page.getByRole('textbox', { name: 'Message your agent' }).fill('HEADLESS_VISUAL: Crie um modelo azul e valide a aparência.')
+  await page.getByRole('button', { name: 'Send message', exact: true }).click()
+  await expect(page.locator('.chat-message.assistant').last()).toContainText('Visual review completed after the final revision.', { timeout: 40_000 })
+  expect(qualityPrematureFinish).toBe(true)
+  expect(requests).toHaveLength(9)
+  expect(requests.some(request => request.messages.some((m: any) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('no accepted quality review')))).toBe(true)
+  const saved = JSON.parse(readFileSync(join(data, 'workspace.json'), 'utf8'))
+  const session = saved.sessions.find((s: any) => s.title.startsWith('HEADLESS_VISUAL'))
+  expect(session.status).toBe('idle')
+  expect(session.memory.brief.acceptance).toEqual(['Blue model'])
+  expect(session.memory.review).toMatchObject({ verdict: 'pass', current: true })
+  expect(JSON.stringify(saved)).not.toContain('data:image/')
+  await page.screenshot({ path: 'test-results/visual-acceptance-headless.png' })
 })

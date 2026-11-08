@@ -11,7 +11,7 @@ const directories: string[] = []
 afterEach(() => { if (process.env.KEEP_FAKE) return; for (const d of directories.splice(0)) rmSync(d, { recursive: true, force: true }) })
 
 /** A stand-in for the `claude` program: reads the same flags, connects to the MCP bridge, and prints stream-json. */
-function fakeClaude() {
+function fakeClaude(inactivityMs?: number) {
   const directory = mkdtempSync(join(tmpdir(), 'rbx-fake-claude-'))
   directories.push(directory)
   const log = join(directory, 'log.json')
@@ -28,6 +28,7 @@ process.on('unhandledRejection', error => { record.error = String(error); save('
 const config = JSON.parse(readFileSync(argv[argv.indexOf('--mcp-config') + 1], 'utf8')).mcpServers.rbx
 let prompt = ''
 for await (const chunk of process.stdin) prompt += chunk
+if (argv.includes('--input-format')) { record.input = JSON.parse(prompt); prompt = record.input.message.content.filter(c => c.type === 'text').map(c => c.text).join('\\n') }
 record.prompt = prompt
 record.system = readFileSync(argv[argv.indexOf('--system-prompt-file') + 1], 'utf8')
 const emit = event => console.log(JSON.stringify(event))
@@ -42,6 +43,13 @@ save('connected')
 record.tools = (await client.listTools()).tools.map(t => t.name)
 save('listed')
 record.results = []
+if (prompt.includes('ABANDON_TOOL')) {
+  void client.callTool({ name: 'call_tool', arguments: {} }).catch(() => {})
+  await new Promise(resolve => setTimeout(resolve, 200))
+  await client.close()
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
 emit({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Checking. ' } } })
 for (const call of JSON.parse(prompt.split('PLAN ')[1].split('\\n')[0])) {
   emit({ type: 'assistant', message: { usage: { input_tokens: 100, output_tokens: 10 } } })
@@ -54,7 +62,7 @@ save('done')
 await client.close()
 process.exit(0)
 `)
-  const claude = new ClaudeCode(() => ({ command: process.execPath, args: [script] }))
+  const claude = new ClaudeCode(() => ({ command: process.execPath, args: [script] }), inactivityMs)
   return { claude, recorded: () => JSON.parse(readFileSync(log, 'utf8')) }
 }
 const tools: ToolSpec[] = [{ name: 'search_tools', description: 'Find tools', parameters: { type: 'object', properties: { query: { type: 'string' } } } }, { name: 'call_tool', description: 'Run a tool', parameters: { type: 'object' } }]
@@ -62,6 +70,31 @@ const plan = (...calls: { name: string; args: object }[]) => [{ role: 'system' a
 const base = { executable: '', model: 'haiku', tools, signal: new AbortController().signal, onText: () => {} }
 
 describe('Claude Code provider', () => {
+  it('delivers native MCP images and image input without reducing them to textual descriptions', async () => {
+    const { claude, recorded } = fakeClaude()
+    const image = { mimeType: 'image/png' as const, data: 'iVBORw0KGgo=' }
+    const turns = plan({ name: 'call_tool', args: {} }); Object.assign(turns[1], { images: [image] })
+    await claude.turn({ ...base, turns, execute: async () => ({ text: 'Actual view', images: [image] }) })
+    expect(recorded().input.message.content[1]).toMatchObject({ type: 'image', source: { type: 'base64', data: image.data } })
+    expect(recorded().results[0].content[1]).toEqual({ type: 'image', mimeType: image.mimeType, data: image.data })
+  })
+  it('fails when the tool result connection disappears, even if the process stays alive', async () => {
+    const { claude } = fakeClaude()
+    await expect(claude.turn({ ...base, turns: [{ role: 'user', content: 'ABANDON_TOOL' }], execute: async () => new Promise(() => {}) })).rejects.toThrow('disconnected while waiting')
+  })
+  it('fails explicitly when the process stays silent instead of hanging forever', async () => {
+    const { claude } = fakeClaude(500)
+    await expect(claude.turn({ ...base, turns: [{ role: 'user', content: 'HANG' }], execute: async () => 'ok' })).rejects.toThrow('stopped responding')
+  })
+
+  it('suspends the inactivity timeout while waiting for delegation or human approval', async () => {
+    const { claude } = fakeClaude(3000)
+    const result = await claude.turn({ ...base, turns: plan({ name: 'call_tool', args: {} }), execute: async () => {
+      await new Promise(resolve => setTimeout(resolve, 3300))
+      return 'Worker report.'
+    } })
+    expect(result.text).toBe('Done.')
+  }, 10_000)
   it('runs Claude Code without its own tools and serves ours through an authenticated local bridge', async () => {
     const { claude, recorded } = fakeClaude()
     const text: string[] = [], calls: string[] = []

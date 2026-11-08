@@ -1,7 +1,8 @@
 import type { Turn } from './providers'
 import type { Effort, McpServer, McpTool, Message, PinnedPage, PlanStep, Session, SessionMemory } from '../shared/types'
+import { MAX_CONTEXT_IMAGES } from './vision'
 
-export const CONTEXT_CHARACTERS = 48_000
+export const CONTEXT_CHARACTERS = 96_000
 export const TOOL_RESULT_CHARACTERS = 6_000
 export const MAX_OUTPUT_TOKENS = 4096
 /** Skill pages kept across messages, newest last. Older pages are evicted first. */
@@ -42,18 +43,29 @@ export function skillPage(text: string, skillId: string, file: string, offset: n
 
 export function toolResultText(result: unknown) {
   return JSON.stringify(result, (_key, value) => {
-    if (value && typeof value === 'object' && ['image', 'audio'].includes(value.type) && typeof value.data === 'string') return { type: 'text', text: `${value.type} output omitted from text context to save tokens.` }
+    if (value && typeof value === 'object' && ['image', 'audio'].includes(value.type) && typeof value.data === 'string') return { type: 'text', text: value.type === 'image' ? 'Image omitted from this textual log; supported inline images are passed separately to the model.' : 'Audio omitted from text context.' }
     return value
   })
+}
+/** Base64 is bounded separately, not counted as millions of text tokens. */
+export function contextSize(turns: Turn[]) {
+  return JSON.stringify(turns, (key, value) => key === 'images' && Array.isArray(value) ? value.map(image => ({ mimeType: image.mimeType, imageInput: true })) : value).length
 }
 
 /** Drop complete old exchanges/tool rounds; never leave orphan tool results. No AI summary request. */
 export function compactTurns(source: Turn[], maximum = CONTEXT_CHARACTERS): Turn[] {
   const turns = structuredClone(source)
+  let kept = 0
+  for (let i = turns.length - 1; i >= 0; i--) if (turns[i].images?.length) {
+    const images = turns[i].images!
+    turns[i].images = images.slice(Math.max(0, images.length - Math.max(0, MAX_CONTEXT_IMAGES - kept)))
+    kept += turns[i].images!.length
+    if (!turns[i].images!.length) { delete turns[i].images; turns[i].content += '\n[Earlier image retired from context; capture a fresh view before judging appearance.]' }
+  }
   const systems = turns.findIndex(t => t.role !== 'system')
   const leading = systems < 0 ? turns.length : systems
   let taskAnchor: Turn | undefined
-  const size = () => JSON.stringify(turns).length + (taskAnchor ? JSON.stringify(taskAnchor).length + 1 : 0)
+  const size = () => contextSize(turns) + (taskAnchor ? JSON.stringify(taskAnchor).length + 1 : 0)
   while (size() > maximum) {
     const firstUser = turns.findIndex(t => t.role === 'user')
     const nextUser = turns.findIndex((t, i) => i > firstUser && t.role === 'user')
@@ -171,6 +183,11 @@ const mark = (status: PlanStep['status']) => status === 'done' ? 'x' : status ==
 export function memoryBlock(session: Session, { skillIds, pinsOnly, noPins }: MemoryOptions = {}) {
   const memory = memoryOf(session)
   const parts: string[] = []
+  if (memory.brief) {
+    const brief = memory.brief
+    parts.push(['## Shared work brief (preserve through compaction; latest user updates take precedence)', `Original user request:\n${brief.original}`, brief.goal && `Goal: ${brief.goal}`, `Visual work: ${brief.visual}`, ...brief.constraints.map(c => `Constraint: ${c}`), ...brief.references.map(r => `Reference: ${r}`), ...brief.acceptance.map(a => `Acceptance: ${a}`), ...brief.updates.map(u => `User update: ${u}`)].filter(Boolean).join(NL))
+  }
+  if (memory.review) parts.push(['## Acceptance review', `Verdict: ${memory.review.verdict}${memory.review.current ? '' : ' (earlier revision; collect fresh evidence)'}`, ...memory.review.criteria.map(c => `${c.status}: ${c.criterion} — ${c.evidence}`), ...memory.review.issues.map(issue => `Unresolved: ${issue}`)].join(NL))
   if (!pinsOnly) {
     if (memory.digest.length) parts.push(['## Earlier in this conversation (folded, oldest first)', ...memory.digest.map(l => `- ${l}`)].join(NL))
     const recent = unfolded(session).filter(m => m.role === 'tool' && !m.agentId).slice(-8).map(m => `- ${clip(m.content.split(NL)[0], 140)}`)

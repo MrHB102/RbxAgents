@@ -29,6 +29,8 @@ export class Store {
     for (const server of this.state.servers) { server.status = 'disconnected'; server.tools = []; delete server.error }
     for (const session of this.state.sessions) if (session.status === 'running' || session.status === 'waiting') {
       session.status = 'idle'
+      for (const message of session.messages) if (message.kind === 'queued') delete message.kind
+      for (const thread of session.lastRun?.threads || []) if (thread.status === 'running') thread.status = 'error'
       session.messages.push({ id: randomUUID(), role: 'system', content: 'This run was interrupted when the app closed. Send a message to continue.', createdAt: new Date().toISOString() })
     }
     const vault = join(directory, 'credentials.enc')

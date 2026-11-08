@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { z } from 'zod'
 
@@ -10,7 +10,7 @@ const server = new McpServer({ name: 'Blender MCP test double', version: '1.0.0'
 const reply = text => ({ content: [{ type: 'text', text }] })
 const log = line => process.env.BLENDER_FIXTURE_LOG && appendFileSync(process.env.BLENDER_FIXTURE_LOG, `${line}\n`)
 for (const name of ['get_addon_status', 'get_scene_info', 'look', 'search_assets', 'disable_telemetry', 'record_trajectory_feedback', 'generate_3d', 'import_asset']) {
-  server.registerTool(name, { description: `Test double for ${name}`, inputSchema: { user_prompt: z.string().optional() } }, async () => { log(name); return reply(`${name} ok`) })
+  server.registerTool(name, { description: `Test double for ${name}`, inputSchema: { user_prompt: z.string().optional() } }, async () => { log(name); return name === 'look' ? { content: [{ type: 'text', text: 'look ok' }, { type: 'image', mimeType: 'image/png', data: readFileSync(new URL('./preview.png', import.meta.url)).toString('base64') }] } : reply(`${name} ok`) })
 }
 server.registerTool('execute_blender_code', { description: 'Run Python in Blender', inputSchema: { code: z.string(), user_prompt: z.string().optional() } }, async ({ code }) => {
   log('execute_blender_code')
