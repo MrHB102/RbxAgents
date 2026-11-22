@@ -7,7 +7,9 @@ import { anthropicImage, imageUrl, type VisionImage } from './vision'
 
 export interface ToolSpec { name: string; description: string; parameters: Record<string, unknown> }
 export interface ToolCall { id: string; name: string; arguments: string }
-export interface Turn { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; images?: VisionImage[]; tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]; tool_call_id?: string; /** Replayable opaque Responses items (encrypted reasoning, messages and function calls). */ responseItems?: Record<string, unknown>[]; /** Anthropic thinking blocks that must be replayed unchanged next to their tool calls. */ thinking?: unknown[] }
+/** A PDF the user attached, sent as a native document to models that read them. */
+export interface TurnDocument { name: string; mimeType: 'application/pdf'; data: string }
+export interface Turn { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; images?: VisionImage[]; documents?: TurnDocument[]; tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]; tool_call_id?: string; /** Replayable opaque Responses items (encrypted reasoning, messages and function calls). */ responseItems?: Record<string, unknown>[]; /** Anthropic thinking blocks that must be replayed unchanged next to their tool calls. */ thinking?: unknown[] }
 export type NativeToolOutput = string | { text: string; images?: VisionImage[] }
 export interface TokenUsage { inputTokens: number; outputTokens: number; cachedInputTokens: number }
 export interface TurnResult { text: string; calls: ToolCall[]; tokens: number; usage?: TokenUsage; thinking?: unknown[]; responseItems?: Record<string, unknown>[] }
@@ -15,7 +17,18 @@ export interface TurnOptions {
   maxOutputTokens: number; effort?: Effort
   /** Claude Code runs its own tool loop; it calls back here for each tool. Other providers ignore this. */
   execute?: (name: string, args: Record<string, unknown>) => Promise<NativeToolOutput>
+  /** Stable per conversation. OpenAI uses it to route requests that share a prefix to the same prompt cache. */
+  cacheKey?: string
 }
+
+function hostOf(provider: Pick<Provider, 'baseUrl'>) { try { return new URL(provider.baseUrl).hostname } catch { return '' } }
+/** Providers that accept a PDF as input. Others get the text extracted on this computer instead. */
+export function supportsPdf(provider: Pick<Provider, 'kind' | 'baseUrl'>, _model: string) {
+  if (provider.kind === 'anthropic' || provider.kind === 'claude-code' || provider.kind === 'chatgpt') return true
+  return ['api.openai.com', 'openrouter.ai'].includes(hostOf(provider))
+}
+const pdfUrl = (document: TurnDocument) => `data:${document.mimeType};base64,${document.data}`
+const anthropicDocument = (document: TurnDocument) => ({ type: 'document', title: document.name.slice(0, 200), source: { type: 'base64', media_type: document.mimeType, data: document.data } })
 
 const ANTHROPIC_EFFORT_MODEL = /^claude-(?:(?:fable|mythos|opus|sonnet|haiku)-5|opus-4-[5-8]|sonnet-4-6)/
 /** Request fields that set reasoning depth. Empty when the provider/model does not take the parameter, so a stray /effort never breaks a run. */
@@ -64,7 +77,7 @@ export class Providers {
     if (provider.kind === 'chatgpt' || (new URL(provider.baseUrl).hostname === 'api.openai.com' && /^gpt-6(?:\.|-)/i.test(model))) return this.responses(provider, model, turns, tools, signal, delta, options)
     const response = await checkedFetch(`${validateEndpoint(provider.baseUrl)}/chat/completions`, {
       method: 'POST', headers: await this.headers(provider), signal,
-      body: JSON.stringify({ model, messages: chatMessages(turns), stream: true, stream_options: { include_usage: true }, ...(new URL(provider.baseUrl).hostname === 'api.openai.com' ? { max_completion_tokens: options.maxOutputTokens } : { max_tokens: options.maxOutputTokens }), ...effortFields(provider, model, options.effort), ...(tools.length ? { tools: tools.map(t => ({ type: 'function', function: t })) } : {}) })
+      body: JSON.stringify({ model, messages: chatMessages(turns), stream: true, stream_options: { include_usage: true }, ...(new URL(provider.baseUrl).hostname === 'api.openai.com' ? { max_completion_tokens: options.maxOutputTokens, ...(options.cacheKey ? { prompt_cache_key: options.cacheKey } : {}) } : { max_tokens: options.maxOutputTokens }), ...effortFields(provider, model, options.effort), ...(tools.length ? { tools: tools.map(t => ({ type: 'function', function: t })) } : {}) })
     })
     let text = '', tokens = 0, finished = false
     const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 }
@@ -93,12 +106,13 @@ export class Providers {
     const input = withImageTurns(turns).filter(t => t.role !== 'system').flatMap(t => {
       if (t.role === 'tool') return [{ type: 'function_call_output', call_id: t.tool_call_id, output: t.content }]
       if (t.role === 'assistant' && t.responseItems?.length) return t.responseItems
-      const messages: Record<string, unknown>[] = t.content || t.images?.length ? [{ role: t.role, content: t.images?.length ? [{ type: 'input_text', text: t.content || 'Observe the tool images.' }, ...t.images.map(image => ({ type: 'input_image', image_url: imageUrl(image), detail: 'auto' }))] : t.content }] : []
+      const rich = !!(t.images?.length || t.documents?.length)
+      const messages: Record<string, unknown>[] = t.content || rich ? [{ role: t.role, content: rich ? [{ type: 'input_text', text: t.content || 'Observe the attached content.' }, ...(t.images || []).map(image => ({ type: 'input_image', image_url: imageUrl(image), detail: 'auto' })), ...(t.documents || []).map(document => ({ type: 'input_file', filename: document.name, file_data: pdfUrl(document) }))] : t.content }] : []
       for (const call of t.tool_calls || []) messages.push({ type: 'function_call', call_id: call.id, name: call.function.name, arguments: call.function.arguments })
       return messages
     })
     const response = await checkedFetch(`${validateEndpoint(provider.baseUrl)}/responses`, { method: 'POST', headers: await this.headers(provider), signal,
-      body: JSON.stringify({ model, instructions: turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'), input, stream: true, store: false, include: ['reasoning.encrypted_content'], max_output_tokens: options.maxOutputTokens, ...reasoning, ...(tools.length ? { tools: tools.map(t => ({ type: 'function', ...t, strict: false })) } : {}) }) })
+      body: JSON.stringify({ model, instructions: turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'), input, stream: true, store: false, include: ['reasoning.encrypted_content'], max_output_tokens: options.maxOutputTokens, ...(options.cacheKey && hostOf(provider) === 'api.openai.com' ? { prompt_cache_key: options.cacheKey } : {}), ...reasoning, ...(tools.length ? { tools: tools.map(t => ({ type: 'function', ...t, strict: false })) } : {}) }) })
     let text = '', tokens = 0, completed = false
     const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 }
     const calls: ToolCall[] = []
@@ -128,10 +142,12 @@ export class Providers {
         else messages.push({ role: 'user', content: [content] })
       } else if (turn.role === 'user' && messages.at(-1)?.role === 'user') {
         // A user update that follows tool results must share their message; tool_result blocks stay first.
-        messages.at(-1)!.content.push({ type: 'text', text: turn.content })
+        messages.at(-1)!.content.push(...(turn.documents || []).map(anthropicDocument), { type: 'text', text: turn.content })
         if (turn.images?.length) messages.at(-1)!.content.push(...turn.images.map(anthropicImage))
       } else {
         const content: Record<string, unknown>[] = [...(turn.thinking as Record<string, unknown>[] | undefined || [])]
+        // Documents go before the question about them, as Anthropic recommends.
+        if (turn.documents?.length && turn.role === 'user') content.push(...turn.documents.map(anthropicDocument))
         if (turn.content) content.push({ type: 'text', text: turn.content })
         if (turn.images?.length && turn.role === 'user') content.push(...turn.images.map(anthropicImage))
         for (const call of turn.tool_calls || []) content.push({ type: 'tool_use', id: call.id, name: call.function.name, input: JSON.parse(call.function.arguments) })
@@ -193,5 +209,5 @@ function withImageTurns(turns: Turn[]): Turn[] {
   return output
 }
 function chatMessages(turns: Turn[]) {
-  return withImageTurns(turns).map(({ thinking: _thinking, responseItems: _responseItems, images, ...turn }) => ({ ...turn, ...(images?.length && turn.role === 'user' ? { content: [{ type: 'text', text: turn.content }, ...images.map(image => ({ type: 'image_url', image_url: { url: imageUrl(image) } }))] } : {}) }))
+  return withImageTurns(turns).map(({ thinking: _thinking, responseItems: _responseItems, images, documents, ...turn }) => ({ ...turn, ...((images?.length || documents?.length) && turn.role === 'user' ? { content: [{ type: 'text', text: turn.content }, ...(images || []).map(image => ({ type: 'image_url', image_url: { url: imageUrl(image) } })), ...(documents || []).map(document => ({ type: 'file', file: { filename: document.name, file_data: pdfUrl(document) } }))] } : {}) }))
 }

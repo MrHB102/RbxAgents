@@ -15,7 +15,7 @@ import { CLAUDE_CODE_MODELS } from './claudecode'
 import { MEDIA_SCHEME, MediaStore } from './media'
 import { BLENDER_ID, BLENDER_REPOSITORY } from '../shared/defaults'
 import { EFFORTS } from '../shared/commands'
-import type { Agent, McpServer, Provider } from '../shared/types'
+import type { Agent, McpServer, MediaItem, Provider } from '../shared/types'
 
 const id = z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/)
 const short = z.string().trim().min(1).max(200)
@@ -36,6 +36,15 @@ let runtime: AgentRuntime
 let media: MediaStore
 let quitting = false
 const claudeLogins = new Map<string, AbortController>()
+/** Files attached in the composer but not sent yet. Only the main process decides what an id refers to. */
+const pendingAttachments = new Map<string, MediaItem>()
+const MAX_PENDING = 40
+const bytes = z.custom<Uint8Array>(value => value instanceof Uint8Array, 'Expected file data.')
+const attachSchema = z.object({
+  path: z.string().max(4000).optional(), data: bytes.optional(), name: z.string().max(400),
+  frames: z.array(bytes).max(8).optional(),
+  meta: z.object({ width: z.number().optional(), height: z.number().optional(), duration: z.number().optional() }).optional()
+})
 const rendererFile = join(import.meta.dirname, '../renderer/index.html')
 const devUrl = !app.isPackaged ? process.env.ELECTRON_RENDERER_URL : undefined
 const testDirectory = !app.isPackaged ? process.env.RBX_AGENTS_TEST_DATA : undefined
@@ -61,7 +70,11 @@ function createWindow() {
 
 /** Deletes preview files that no conversation refers to any more. */
 function pruneMedia(options: { incoming?: boolean } = {}) {
-  media.prune(new Set(store.state.sessions.flatMap(s => s.messages.flatMap(m => (m.media || []).map(item => item.id)))), options)
+  const items = [...store.state.sessions.flatMap(s => s.messages.flatMap(m => m.media || [])), ...pendingAttachments.values()]
+  media.prune(new Set(items.flatMap(item => [item.id, ...(item.frames || [])])), options)
+}
+function findMedia(mediaId: string) {
+  return pendingAttachments.get(mediaId) || store.state.sessions.flatMap(s => s.messages.flatMap(m => m.media || [])).find(item => item.id === mediaId)
 }
 
 function requireIdleProvider(providerId: string) {
@@ -185,10 +198,24 @@ async function action(name: string, payload: unknown): Promise<unknown> {
       const result = await dialog.showOpenDialog(mainWindow!, { title: 'Choose your Blender program', properties: process.platform === 'darwin' ? ['openDirectory'] : ['openFile'], ...(process.platform === 'win32' ? { filters: [{ name: 'Blender', extensions: ['exe'] }] } : {}) })
       return result.canceled ? null : result.filePaths[0]
     }
+    case 'attachment:add': {
+      if (pendingAttachments.size >= MAX_PENDING) throw new Error('Send or remove the files already attached first.')
+      const data = attachSchema.parse(payload)
+      const item = media.attach(data)
+      pendingAttachments.set(item.id, item)
+      return item
+    }
+    case 'attachment:discard': {
+      const item = pendingAttachments.get(z.string().max(100).parse(payload))
+      if (item) { pendingAttachments.delete(item.id); media.remove(item) }
+      return
+    }
     case 'media:save': {
-      const found = media.locate(z.string().max(100).parse(payload))
-      if (!found) throw new Error('This preview is no longer available.')
-      const result = await dialog.showSaveDialog(mainWindow!, { title: 'Save preview', defaultPath: `blender-preview${found.path.slice(found.path.lastIndexOf('.'))}` })
+      const mediaId = z.string().max(100).parse(payload)
+      const found = media.locate(mediaId)
+      if (!found) throw new Error('This file is no longer available.')
+      const item = findMedia(mediaId)
+      const result = await dialog.showSaveDialog(mainWindow!, { title: item?.source === 'user' ? 'Save attachment' : 'Save preview', defaultPath: item?.source === 'user' ? item.name : `blender-preview${found.path.slice(found.path.lastIndexOf('.'))}` })
       if (result.canceled || !result.filePath) return false
       copyFileSync(found.path, result.filePath); return true
     }
@@ -226,8 +253,11 @@ async function action(name: string, payload: unknown): Promise<unknown> {
       store.state.sessions = store.state.sessions.filter(s => s.id !== sessionId); store.save(); pruneMedia(); return
     }
     case 'session:send': {
-      const data = z.object({ id, content: z.string().trim().min(1).max(100_000) }).parse(payload)
-      return runtime.send(data.id, data.content)
+      const data = z.object({ id, content: z.string().trim().max(100_000), attachments: z.array(z.string().max(100)).max(20).default([]) }).parse(payload)
+      const items = data.attachments.map(mediaId => { const item = pendingAttachments.get(mediaId); if (!item) throw new Error('An attached file is no longer available. Attach it again.'); return item })
+      const result = await runtime.send(data.id, data.content, items)
+      for (const item of items) pendingAttachments.delete(item.id)
+      return result
     }
     case 'session:stop': runtime.stop(id.parse(payload)); return
     case 'session:model': {

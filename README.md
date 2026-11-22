@@ -21,6 +21,7 @@ Built with a clean Dracula-inspired interface, a complete Roblox skill library, 
 - **Build your team.** Create, duplicate, pause, and configure agents. Start with a Master, Architect, Builder, Scripter, and Reviewer.
 - **Let a Master Agent run the team.** The Master plans, delegates self-contained briefs to your specialists in parallel, and synthesizes their reports. Put a strong model on the Master and cheaper ones on the workers. It can propose new agents, but you must approve each one, even in Unrestricted mode. See [docs/MASTER_AGENT.md](docs/MASTER_AGENT.md).
 - **Reach the internet.** Agents can search the web and read public pages (`web_search`, `web_fetch`), for example current Roblox documentation and DevForum answers. Local and private addresses are blocked. See [Web access](#web-access).
+- **Attach any file to a message.** Click the paperclip, drop files on the chat, or paste a screenshot. Images and video stills go to the model as pictures; PDFs go as native documents to models that read them; Word, Excel, PowerPoint, OpenDocument, code, text, ZIP listings and Roblox XML models are read as text on your computer; audio and binary 3D models (FBX, GLB, .rbxm, .blend…) are kept with their path so tools such as Blender can open them. See [Attachments](#attachments).
 - **Steer while it works.** Send a message at any time: it is delivered before the agent's next step. Use `/btw` for a side question, `/model` and `/effort` to change model and reasoning depth from the chat.
 - **Choose a model for each agent.** Connect OpenAI-compatible APIs, local inference servers, Anthropic, your installed Claude Code, or an eligible ChatGPT account. Discover models or enter a model ID yourself.
 - **Set their instructions.** Combine a workspace system prompt, individual agent instructions, and selected skills.
@@ -78,7 +79,9 @@ Economy context handling is on by default, including for existing agents:
 - The model receives a small `search_tools` / `call_tool` interface instead of every connected MCP tool definition on every request. Exact tool schemas are discovered only when needed.
 - All 29 skills remain installed. Skill instructions are loaded in pages of up to 5,000 characters. **Pages an agent has read are remembered for the whole conversation** (up to 9,000 characters, oldest evicted first) and shared with the workers that have the skill, so they are neither fetched nor re-paid for on every message.
 - **Session memory replaces the old "forget on the next message" behavior.** The last three exchanges are sent verbatim. Older ones are folded locally into one line each (request, actions, result), together with a short list of recent actions and the current plan. No model call is used to summarize. `/compact` and `/clear` control this by hand.
-- **Prompt caching.** For Anthropic models the app marks tools, system blocks, and the newest message as cacheable, so every step of a run re-reads its prefix at the cached price. Instructions are kept byte-stable between steps. OpenAI caches stable prefixes on its own; other OpenAI-compatible servers vary.
+- **Prompt caching.** For Anthropic models the app marks tools, system blocks, and the newest message as cacheable, so every step of a run re-reads its prefix at the cached price. Instructions and the session memory block are kept byte-stable for the whole run (the memory is rewritten only when compaction has changed the prefix anyway). OpenAI requests carry a per-conversation `prompt_cache_key`; other OpenAI-compatible servers vary. See [docs/PIPELINE.md](docs/PIPELINE.md).
+- **Compaction that keeps the trail.** When the context is full, the oldest tool results are cleared first while their calls stay, then older rounds are dropped, and the context is brought down to 75% of the limit so compaction (and a cache rebuild) does not happen again on the next step.
+- **Faster, steadier runs.** Independent reads in one response (web searches, page reads, skill pages, attachments, tool searches) run at the same time. An agent that repeats the exact same call and gets the same answer three times is told so, without being blocked.
 - Tool text results are capped at 6,000 characters. Supported inline tool images are sent separately to vision-capable models; their base64 is excluded from textual logs and workspace JSON. Up to two images per result (4 MB each) and four recent images in model context are retained. Images add provider token usage.
 - Serialized text context and tool definitions are limited to 96,000 characters per request. The original request, structured work brief, references, acceptance criteria and recent user updates survive transcript compaction and are shared with workers. Old tool rounds are removed locally when needed; oversized instructions fail before inference.
 - Visual work uses `set_brief` and `assess_quality`: a pass requires current image evidence and every acceptance criterion, and later changes invalidate it. Missing capabilities can be recorded as blocked. The runtime prevents an unreviewed visual mutation from silently becoming a completed task. These checks organize evidence; they do not guarantee artistic quality.
@@ -87,6 +90,22 @@ Economy context handling is on by default, including for existing agents:
 - The conversation inspector separates **Conversation tokens**, **Last run tokens**, model request count, approximate context size, and cached input. Cached input is part of the reported input total, not an extra charge added by the app. Estimates are labeled when provider usage is unavailable.
 
 Opening the app or creating a conversation does not start model inference. Inference starts only when you send a message. The conversation total is cumulative and can include earlier runs; it is not startup usage or a price estimate. Actual plan consumption and billing depend on your provider. See [OpenAI’s prompt-caching documentation](https://developers.openai.com/api/docs/guides/prompt-caching) for the distinction between input, cached input, and cache writes.
+
+### Attachments
+
+Up to 10 files per message, up to 1 GB each (pasted data up to 64 MB). Every file is copied into the app's media folder, checked by content as well as extension, and kept with the conversation; nothing is uploaded until you send the message.
+
+| What you attach | What the model gets |
+| --- | --- |
+| PNG, JPEG, WebP, GIF, BMP, AVIF | The picture, downscaled on your computer to at most 1568 px (the size vision models use anyway) |
+| MP4, MOV, WebM, MKV, OGV | 2–4 evenly spaced still frames (≤ 1024 px), duration and size. Models cannot play video or hear its sound |
+| PDF | A native PDF document for Anthropic, Claude Code, ChatGPT, OpenAI and OpenRouter (up to 24 MB); text extracted locally for other providers |
+| DOCX, XLSX, PPTX, ODT, ODS, ODP, RTF | Text extracted locally (sheets as tab-separated rows, slides in order) |
+| Code and text (Luau, Lua, JSON, Markdown, CSV, YAML, XML, .rbxmx/.rbxlx, …) | The text |
+| ZIP, USDZ | The list of entries |
+| Audio, FBX, GLB, STL, .rbxm, .blend, other binaries | Name, type, size and the saved path, so an agent with Blender or another local tool can open the file |
+
+Cost control: the message that carries the files sends their pictures, documents and up to 8,000 characters per file (24,000 in total). Later messages only list the files; the agent reads any of them again with the `read_attachment` tool, page by page, only when it needs to. Pictures of older messages are dropped from context first. Unsent files are deleted when you remove them or leave the conversation.
 
 ### Chat commands and messages while it works
 
@@ -218,6 +237,9 @@ Build artifacts are written to `release/`. Build on the target OS, or use the in
 # Windows NSIS installer with x64 and ARM64 payloads
 npm run dist:win
 
+# Every Windows installer: x64, ARM64, combined x64 + ARM64, and legacy 32-bit (ia32)
+npm run dist:win:all
+
 # Linux AppImage and Debian packages: x64 and ARM64
 npm run dist:linux
 
@@ -293,7 +315,7 @@ Independent agent conversations can run concurrently. Each uses a snapshot of it
 ## Current limitations
 
 - Live ChatGPT OAuth, live Anthropic API inference, and real Studio place edits require the user’s account and Studio connection; fixture tests do not establish those external services’ availability.
-- Image feedback requires an image-capable model and a tool that returns supported inline pixels. Videos are not analyzed as frames; obtain still views. The composer does not yet accept image attachments. Local `share_media` stays display-only; `inspect_image` explicitly sends a same-conversation image to the selected model, with approval outside Unrestricted mode.
+- Image feedback requires an image-capable model and a tool that returns supported inline pixels. Attached videos reach the model as a few still frames, not as motion or sound. PDF text extraction for providers without native PDF input is best-effort and does not read scanned pages. Attachments to a model that cannot take images make that provider return an error. Local `share_media` stays display-only; `inspect_image` explicitly sends a same-conversation image to the selected model, with approval outside Unrestricted mode.
 - The Master Agent delegates within one message: worker threads live for that message and inherit the shared brief, not the full conversation or other workers' transcripts. Current scene images reach the Master, and `read_agent_report` retrieves report details omitted from delegation summaries. Workers do not run in the background after the Master answers.
 - The project folder setting labels your workspace. Direct project filesystem tools, terminal access, and Rojo synchronization are not implemented; Studio access goes through MCP.
 - MCP OAuth discovery, automatic skill updates, configuration import, automatic application updates, and signed releases are not implemented.

@@ -49,24 +49,57 @@ export function toolResultText(result: unknown) {
 }
 /** Base64 is bounded separately, not counted as millions of text tokens. */
 export function contextSize(turns: Turn[]) {
-  return JSON.stringify(turns, (key, value) => key === 'images' && Array.isArray(value) ? value.map(image => ({ mimeType: image.mimeType, imageInput: true })) : value).length
+  return JSON.stringify(turns, (key, value) => key === 'images' && Array.isArray(value) ? value.map(image => ({ mimeType: image.mimeType, imageInput: true }))
+    : key === 'documents' && Array.isArray(value) ? value.map(document => ({ name: document.name, documentInput: true })) : value).length
 }
+
+/** Once compaction starts it shrinks the context to this share of the limit, so it does not run (and invalidate the prompt cache) on every following step. */
+export const COMPACT_TARGET = 0.75
+/** Tool rounds whose results are never cleared: the model is still working with them. */
+const KEEP_TOOL_ROUNDS = 2
+const CLEARED = '[Older tool result cleared to save context. Run the tool again if you need it.]'
 
 /** Drop complete old exchanges/tool rounds; never leave orphan tool results. No AI summary request. */
 export function compactTurns(source: Turn[], maximum = CONTEXT_CHARACTERS): Turn[] {
+  return compactContext(source, maximum).turns
+}
+
+/**
+ * Keeps the context under `maximum` characters without a model call. In order of preference: retire old images,
+ * clear the text of old tool results (the call and its arguments stay, so the model still knows what it did),
+ * drop earlier exchanges, drop old tool rounds, shorten one large recent result. `changed` reports whether anything
+ * before the newest turns was altered, which is when the provider's prompt cache has to be rebuilt anyway.
+ */
+export function compactContext(source: Turn[], maximum = CONTEXT_CHARACTERS): { turns: Turn[]; changed: boolean } {
   const turns = structuredClone(source)
+  let changed = false
+  // Attached files belong to the user turn that carries them; only the newest such turn keeps its pictures and documents.
+  const latestAttachment = turns.map(t => t.role === 'user' && !!(t.images?.length || t.documents?.length)).lastIndexOf(true)
+  for (let i = 0; i < turns.length; i++) if (turns[i].role === 'user' && i !== latestAttachment && (turns[i].images?.length || turns[i].documents?.length)) {
+    delete turns[i].images; delete turns[i].documents; changed = true
+    turns[i].content += '\n[Attached pictures and documents of this earlier message were removed from context; read_attachment brings them back.]'
+  }
   let kept = 0
-  for (let i = turns.length - 1; i >= 0; i--) if (turns[i].images?.length) {
+  for (let i = turns.length - 1; i >= 0; i--) if (turns[i].images?.length && i !== latestAttachment) {
     const images = turns[i].images!
     turns[i].images = images.slice(Math.max(0, images.length - Math.max(0, MAX_CONTEXT_IMAGES - kept)))
     kept += turns[i].images!.length
+    if (turns[i].images!.length < images.length) changed = true
     if (!turns[i].images!.length) { delete turns[i].images; turns[i].content += '\n[Earlier image retired from context; capture a fresh view before judging appearance.]' }
   }
   const systems = turns.findIndex(t => t.role !== 'system')
   const leading = systems < 0 ? turns.length : systems
   let taskAnchor: Turn | undefined
   const size = () => contextSize(turns) + (taskAnchor ? JSON.stringify(taskAnchor).length + 1 : 0)
-  while (size() > maximum) {
+  if (size() <= maximum) return { turns, changed }
+  changed = true
+  const target = Math.floor(maximum * COMPACT_TARGET)
+  while (size() > target) {
+    // Lightest touch first: clear old tool results, keeping their calls.
+    const rounds = turns.map((t, i) => t.role === 'assistant' && t.tool_calls?.length ? i : -1).filter(i => i >= 0)
+    const protectedFrom = rounds.length > KEEP_TOOL_ROUNDS ? rounds[rounds.length - KEEP_TOOL_ROUNDS] : 0
+    const stale = turns.findIndex((t, i) => i < protectedFrom && t.role === 'tool' && t.content.length > CLEARED.length + 200 && !t.content.startsWith(CLEARED))
+    if (stale >= 0) { turns[stale].content = `${CLEARED} It began: ${clip(turns[stale].content, 160)}`; delete turns[stale].images; continue }
     const firstUser = turns.findIndex(t => t.role === 'user')
     const nextUser = turns.findIndex((t, i) => i > firstUser && t.role === 'user')
     if (firstUser >= 0 && nextUser >= 0) {
@@ -85,10 +118,11 @@ export function compactTurns(source: Turn[], maximum = CONTEXT_CHARACTERS): Turn
     // A single large recent result can be shortened without changing its call ID or arguments.
     const tool = turns.find(t => t.role === 'tool' && t.content.length > 600)
     if (tool) { tool.content = boundedText(tool.content, 600); continue }
+    if (size() <= maximum) break
     throw new Error('The current message or system prompts exceed the economy context limit. Shorten them or split the task into smaller messages.')
   }
   if (taskAnchor) turns.splice(leading, 0, taskAnchor)
-  return turns
+  return { turns, changed }
 }
 
 export function findTools(servers: McpServer[], query: string, readOnly: boolean, limit = 3) {
@@ -133,7 +167,8 @@ export function digestExchange(group: Message[]) {
   for (const m of rest) if (m.role === 'tool' && !m.agentId) { const name = m.content.split('\n')[0].split(' ')[0]; tools.set(name, (tools.get(name) || 0) + 1) }
   const answer = [...rest].reverse().find(m => m.role === 'assistant' && m.content && !m.agentId)
   const actions = [...tools].slice(0, 6).map(([name, n]) => n > 1 ? `${name}×${n}` : name).join(', ')
-  return [`User: ${clip(user.content, 160)}`, actions && `Actions: ${actions}`, answer && `Result: ${clip(answer.content, 280)}`].filter(Boolean).join(' | ')
+  const files = (user.media || []).filter(item => item.source === 'user').map(item => `${item.name} (${item.id})`)
+  return [`User: ${clip(user.content, 160)}`, files.length && `Attached: ${clip(files.join(', '), 240)}`, actions && `Actions: ${actions}`, answer && `Result: ${clip(answer.content, 280)}`].filter(Boolean).join(' | ')
 }
 
 function addDigest(memory: SessionMemory, lines: string[]) {
@@ -163,10 +198,14 @@ export function foldAll(session: Session) {
 }
 
 /** User/assistant turns that follow the fold point. Old answers are bounded; tool rounds are summarized elsewhere. */
-export function historyTurns(session: Session): Turn[] {
+export function historyTurns(session: Session, decorate?: (message: Message, latest: boolean) => Partial<Turn>): Turn[] {
   const messages = unfolded(session).filter(m => (m.role === 'user' || m.role === 'assistant') && m.kind !== 'queued' && !m.agentId)
   const lastAssistant = messages.map(m => m.role).lastIndexOf('assistant')
-  return messages.map((m, i) => ({ role: m.role as 'user' | 'assistant', content: m.role === 'assistant' && i !== lastAssistant ? boundedText(m.content, HISTORY_ANSWER_CHARACTERS) : m.content }))
+  const lastUser = messages.map(m => m.role).lastIndexOf('user')
+  return messages.map((m, i) => {
+    const turn: Turn = { role: m.role as 'user' | 'assistant', content: m.role === 'assistant' && i !== lastAssistant ? boundedText(m.content, HISTORY_ANSWER_CHARACTERS) : m.content }
+    return decorate && m.role === 'user' && m.media?.length ? { ...turn, ...decorate(m, i === lastUser) } : turn
+  })
 }
 
 export function pinPage(session: Session, page: PinnedPage) {

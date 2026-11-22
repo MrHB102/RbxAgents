@@ -1,6 +1,6 @@
 {
   "name": "rbx-agents",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "A local-first desktop workspace for AI agents that build Roblox experiences.",
   "homepage": "https://github.com/MrHB102/RbxAgents",
   "main": "out/main/index.js",
@@ -22,7 +22,8 @@
     "dist:linux": "npm run build && electron-builder --linux --x64 --arm64 --publish never",
     "dist:legacy:win": "npm run build && electron-builder --win --ia32 --config.electronVersion=43.8.3 --publish never",
     "dist:legacy:linux": "npm run build && electron-builder --linux tar.gz --armv7l --config.electronVersion=43.8.3 --publish never",
-    "verify:skills": "node scripts/verify-skills.mjs"
+    "verify:skills": "node scripts/verify-skills.mjs",
+    "dist:win:all": "npm run build && electron-builder --win --x64 --arm64 --publish never && electron-builder --win --ia32 --config.electronVersion=43.8.3 --publish never"
   },
   "dependencies": {
     "@chrrxs/robloxstudio-mcp": "3.3.0",

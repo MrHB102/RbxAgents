@@ -26,8 +26,18 @@ export interface McpServer {
   blenderPath?: string
 }
 export interface McpTool { name: string; description: string; inputSchema: Record<string, unknown>; readOnly: boolean }
-/** A rendered preview or image an agent shared in the chat. The file lives in the app's media folder, never in the saved workspace. */
-export interface MediaItem { id: string; kind: 'video' | 'image'; mime: string; name: string; bytes: number; caption?: string }
+export type MediaKind = 'video' | 'image' | 'audio' | 'pdf' | 'document' | 'text' | 'archive' | 'model' | 'file'
+/** A file in a chat: a preview an agent shared, or a file the user attached. The file lives in the app's media folder, never in the saved workspace. */
+export interface MediaItem {
+  id: string; kind: MediaKind; mime: string; name: string; bytes: number; caption?: string
+  /** `user` = attached to a message by the user. Agent previews have no source. */
+  source?: 'user'
+  /** Human description of the type, e.g. "Word document". */
+  label?: string
+  /** Downscaled stills (JPEG) made on this computer: the picture of an image, or frames of a video. These are what a model sees. */
+  frames?: string[]
+  width?: number; height?: number; duration?: number; pages?: number
+}
 /** `queued` = sent while the agent was working, not delivered yet. `btw`/`command` never enter the model context. */
 export type MessageKind = 'queued' | 'btw' | 'command'
 export interface Message { id: string; role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt: string; kind?: MessageKind; agentId?: string; media?: MediaItem[] }
@@ -68,6 +78,8 @@ export interface AppState {
 export interface RuntimeState extends AppState { approvals: Approval[]; secureStorage: boolean; platform: string; appVersion: string; /** A Brave Search API key is saved (otherwise web search uses DuckDuckGo). */ webSearchKey: boolean }
 export interface Bridge {
   invoke<T = unknown>(action: string, payload?: unknown): Promise<T>
+  /** Path of a file dropped or picked in the window; empty for pasted data. */
+  pathForFile(file: File): string
   onState(callback: (state: RuntimeState) => void): () => void
 }
 declare global { interface Window { rbx: Bridge } }

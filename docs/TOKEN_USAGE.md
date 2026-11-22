@@ -1,5 +1,14 @@
 # Token usage and context
 
+## 0.4.0: a cache that holds, and attachments that are paid for once
+
+- **Stable memory block.** The session memory system block is written when a participant starts and left unchanged for the rest of the run. It used to change after every tool call (recent actions, newly pinned skill pages), which made Anthropic rewrite the whole conversation into the cache on every step. Skill pages read during a run are no longer sent twice (tool result plus memory). The next message, and workers started later in the run, still see everything that was learned.
+- **Compaction with headroom.** When the context passes 96,000 characters it is brought down to 72,000, so the following steps do not compact (and rebuild the cache) again. Old tool results are cleared first, keeping each call and a short excerpt; dropping exchanges and rounds comes after.
+- **OpenAI `prompt_cache_key`.** Requests to `api.openai.com` (Chat Completions and Responses) carry a stable key per conversation and agent.
+- **Attachments.** Pictures (downscaled to ≤ 1568 px, video stills ≤ 1024 px, at most 8 per message), native PDFs (≤ 24 MB, providers that support them) and up to 24,000 characters of extracted text are sent only with the message that carries them. Later messages list each file in one line; `read_attachment` reads it again in pages of up to 5,000 characters when needed. Image input is still estimated at 1,500 tokens per picture when the provider does not report usage; PDF input is estimated from its size.
+
+See [PIPELINE.md](PIPELINE.md) for the sources behind these changes.
+
 ## November 2026: visual evidence and durable work briefs
 
 The text context ceiling is now 96,000 characters. The original request, structured brief, recent user updates and acceptance review survive transcript folding and are shared with delegated workers. The last three exchanges still remain verbatim; `/clear` resets the brief and review as well as the digest.

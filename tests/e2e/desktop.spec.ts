@@ -1,7 +1,7 @@
 import { test, expect, _electron as electron, type ElectronApplication } from '@playwright/test'
 import { createServer, type Server } from 'node:http'
 import { createServer as createSocketServer, type Server as SocketServer } from 'node:net'
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, statSync, readFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -145,6 +145,23 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   await expect(page.locator('.system-message.command')).toContainText('Effort: high')
   await expect(page.getByLabel('Reasoning effort')).toHaveValue('high')
   expect(requests).toHaveLength(2)
+  // Attachments: an image and a script go through the real file input, preload bridge and media store.
+  const script = join(data, 'Spawner.server.lua'); writeFileSync(script, 'local SPAWN_MARKER = workspace:WaitForChild("Spawn")')
+  await page.locator('.composer input[type=file]').setInputFiles([fixture('preview.png'), script])
+  await expect(page.locator('.pending-file.ready')).toHaveCount(2, { timeout: 15_000 })
+  await expect(page.locator('.pending-file').first()).toContainText('PNG image')
+  await composer.fill('Use the attached reference and script.')
+  await page.getByRole('button', { name: 'Send message', exact: true }).click()
+  await expect(page.locator('.chat-message.user .attachment-pictures img')).toHaveCount(1)
+  await expect(page.locator('.chat-message.user .file-chip')).toContainText('Spawner.server.lua')
+  await expect(page.locator('.attachment-tray')).toHaveCount(0)
+  await expect(page.locator('.chat-message.assistant').last()).toContainText('The architecture skill is loaded.', { timeout: 20_000 })
+  const attached = requests[2].messages.at(-1)
+  expect(Array.isArray(attached.content)).toBe(true)
+  expect(attached.content[0].text).toContain('SPAWN_MARKER')
+  expect(attached.content[0].text).toContain('preview.png')
+  expect(attached.content.some((part: any) => part.type === 'image_url' && part.image_url.url.startsWith('data:image/jpeg;base64,'))).toBe(true)
+  expect(requests[2].tools.map((tool: any) => tool.function.name)).toContain('read_attachment')
   await page.screenshot({ path: 'test-results/conversation-desktop.png' })
   // Prompt editing and activity reflect actual run state.
   await page.getByRole('button', { name: 'System prompts', exact: true }).click()
@@ -182,6 +199,10 @@ test('desktop onboarding, complete bundled library, real provider loop, persiste
   await expect(restored.locator('.agent-card').filter({ has: restored.getByRole('heading', { name: 'Architect', exact: true }) })).toContainText('test-roblox-model')
   await restored.getByRole('button', { name: 'Conversations', exact: true }).click()
   await expect(restored.locator('.conversation-list')).toContainText('Load your architecture skill')
+  // Attachments survive a restart, and the picture is still served from the media folder.
+  await restored.locator('.conversation-row').filter({ hasText: 'Load your architecture skill' }).getByRole('button').first().click()
+  await expect(restored.locator('.chat-message.user .file-chip')).toContainText('Spawner.server.lua')
+  await expect.poll(() => restored.locator('.chat-message.user .attachment-pictures img').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0)
 })
 
 test('Blender: one-click install, a connected bridge, and previews that play in the chat', async () => {
@@ -249,10 +270,11 @@ test('Blender: one-click install, a connected bridge, and previews that play in 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   // Only descriptions are saved with the conversation; the files live in the media folder.
   const saved = JSON.parse(readFileSync(join(data, 'workspace.json'), 'utf8'))
-  const items = saved.sessions.flatMap((s: any) => s.messages.flatMap((m: any) => m.media || []))
+  const items = saved.sessions.flatMap((s: any) => s.messages.flatMap((m: any) => m.media || [])).filter((item: any) => item.source !== 'user')
   expect(items.map((item: any) => item.caption)).toEqual(['Test double render', 'Real mp4', 'Real webm', 'Real png'])
   expect(statSync(join(data, 'workspace.json')).size).toBeLessThan(200_000)
-  expect(readdirSync(join(data, 'media')).filter(name => /\.(mp4|webm|png)$/.test(name))).toHaveLength(4)
+  const stored = readdirSync(join(data, 'media'))
+  expect(items.every((item: any) => stored.some(name => name.startsWith(`${item.id}.`)))).toBe(true)
   expect(errors).toEqual([])
 })
 

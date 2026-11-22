@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Activity, ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, AudioLines, BookOpen, Bot, Boxes, Check, CheckCheck, ChevronDown, ChevronRight, Circle, CircleHelp, Code2, Command, Copy, Cpu, Ellipsis, ExternalLink, FileCode2, Folder, FolderOpen, GitBranch, Globe, KeyRound, Layers, LoaderCircle, Maximize2, MessageSquare, Minus, MoreHorizontal, Network, Pencil, Play, Plus, Plug, Radio, RefreshCw, Search, Settings2, Shield, ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Unplug, Users, Workflow, X, Zap } from 'lucide-react'
+import { Activity, ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, AudioLines, BookOpen, Bot, Box, Boxes, Check, CheckCheck, ChevronDown, ChevronRight, Circle, CircleHelp, Code2, Command, Copy, Cpu, Ellipsis, ExternalLink, File as FileIcon, FileArchive, FileAudio, FileCode2, FileImage, FileSpreadsheet, FileText, FileVideo, Folder, FolderOpen, Paperclip, Presentation, GitBranch, Globe, KeyRound, Layers, LoaderCircle, Maximize2, MessageSquare, Minus, MoreHorizontal, Network, Pencil, Play, Plus, Plug, Radio, RefreshCw, Search, Settings2, Shield, ShieldCheck, SlidersHorizontal, Sparkles, Square, Terminal, Trash2, Unplug, Users, Workflow, X, Zap } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { EFFORTS, SLASH_COMMANDS } from '../shared/commands'
 import type { Agent, MediaItem, McpServer, Provider, RuntimeState, Skill } from '../shared/types'
@@ -87,7 +87,7 @@ function App() {
       {page === 'mcp' && <McpPage />}
       {page === 'activity' && <ActivityPage />}
       {page === 'settings' && <SettingsPage />}
-      {page === 'conversations' && (currentSession ? <Chat sessionId={currentSession.id} back={() => setSessionId(null)} /> : <Conversations open={setSessionId} />)}
+      {page === 'conversations' && (currentSession ? <Chat key={currentSession.id} sessionId={currentSession.id} back={() => setSessionId(null)} /> : <Conversations open={setSessionId} />)}
     </main>
     <Inspector page={page} sessionId={sessionId} />
     <footer className="statusbar"><div><GitBranch size={12} /><span>Personal workspace</span><span className="status-separator" /><span>{running} agents running</span></div><div><span><Circle size={8} fill={connected ? '#50fa7b' : '#777988'} stroke="none" />{connected} providers connected</span><span><BookOpen size={12} />{state.skills.length} skills installed</span><span className="dracula-dot" />Dracula</div></footer>
@@ -233,7 +233,103 @@ function McpEditor({ server, close }: { server: McpServer; close: () => void }) 
 function MediaCard({ item }: { item: MediaItem }) {
   const { perform, notify } = useWorkspace()
   const source = `rbx-media://${item.id}`
+  if (item.kind !== 'video' && item.kind !== 'image') return <FileChip item={item} />
   return <figure className="media-card">{item.kind === 'video' ? <video src={source} controls autoPlay loop muted playsInline preload="metadata" aria-label={item.caption || item.name} /> : <img src={source} alt={item.caption || item.name} />}<figcaption><span>{item.caption || item.name}</span><small>{(item.bytes / 1048576).toFixed(1)} MB</small><button className="icon-button" aria-label="Save a copy" onClick={async () => { if (await perform<boolean>('media:save', item.id)) notify('Preview saved.') }}><ArrowDownToLine size={14} /></button><button className="icon-button" aria-label="Show in folder" onClick={() => void perform('media:reveal', item.id)}><FolderOpen size={14} /></button></figcaption></figure>
+}
+
+// ---- Attachments -------------------------------------------------------------------------------------------------
+
+const MAX_ATTACHMENTS = 10
+const IMAGE_FILE = /\.(png|jpe?g|webp|gif|bmp|avif)$/i
+const VIDEO_FILE = /\.(mp4|m4v|mov|webm|mkv|ogv)$/i
+const AUDIO_FILE = /\.(mp3|wav|ogg|oga|opus|flac|m4a|aac|weba)$/i
+const fileSize = (bytes: number) => bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`
+function kindIcon(item: Pick<MediaItem, 'kind' | 'name'>) {
+  if (item.kind === 'image') return FileImage
+  if (item.kind === 'video') return FileVideo
+  if (item.kind === 'audio') return FileAudio
+  if (item.kind === 'archive') return FileArchive
+  if (item.kind === 'model') return Box
+  if (item.kind === 'text') return FileCode2
+  if (item.kind === 'pdf') return FileText
+  if (item.kind === 'document') return /\.(xlsx|ods)$/i.test(item.name) ? FileSpreadsheet : /\.(pptx|odp)$/i.test(item.name) ? Presentation : FileText
+  return FileIcon
+}
+const cleanError = (error: unknown) => String(error instanceof Error ? error.message : error).replace(/^Error invoking remote method '[^']+': (Error: )?/, '')
+
+/** Draws a picture into a JPEG no larger than `limit` pixels on its long side. This is the copy a model sees. */
+async function jpegStill(source: CanvasImageSource, width: number, height: number, limit: number) {
+  const scale = Math.min(1, limit / Math.max(width, height, 1))
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(width * scale)); canvas.height = Math.max(1, Math.round(height * scale))
+  const context = canvas.getContext('2d')
+  if (!context) return undefined
+  context.fillStyle = '#ffffff'; context.fillRect(0, 0, canvas.width, canvas.height)
+  context.drawImage(source, 0, 0, canvas.width, canvas.height)
+  const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85))
+  return blob ? new Uint8Array(await blob.arrayBuffer()) : undefined
+}
+function mediaEvent(element: HTMLMediaElement, event: string) {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); reject(new Error('timeout')) }, 15_000)
+    const done = () => { cleanup(); resolve() }
+    const fail = () => { cleanup(); reject(new Error('unsupported')) }
+    const cleanup = () => { clearTimeout(timer); element.removeEventListener(event, done); element.removeEventListener('error', fail) }
+    element.addEventListener(event, done, { once: true }); element.addEventListener('error', fail, { once: true })
+  })
+}
+/** Downscaled stills of an image or a video, made in the window. Pixels never leave this computer until the message is sent. */
+async function prepareFile(file: File): Promise<{ frames: Uint8Array[]; meta: { width?: number; height?: number; duration?: number } }> {
+  const frames: Uint8Array[] = []
+  const meta: { width?: number; height?: number; duration?: number } = {}
+  const type = file.type
+  try {
+    if ((type.startsWith('image/') && type !== 'image/svg+xml') || IMAGE_FILE.test(file.name)) {
+      const bitmap = await createImageBitmap(file)
+      meta.width = bitmap.width; meta.height = bitmap.height
+      const still = await jpegStill(bitmap, bitmap.width, bitmap.height, 1568)
+      bitmap.close()
+      if (still) frames.push(still)
+    } else if (type.startsWith('video/') || VIDEO_FILE.test(file.name) || type.startsWith('audio/') || AUDIO_FILE.test(file.name)) {
+      const url = URL.createObjectURL(file)
+      const audio = type.startsWith('audio/') || AUDIO_FILE.test(file.name)
+      const element = document.createElement(audio ? 'audio' : 'video')
+      try {
+        element.muted = true; element.preload = 'auto'; element.src = url
+        await mediaEvent(element, audio ? 'loadedmetadata' : 'loadeddata')
+        if (Number.isFinite(element.duration)) meta.duration = element.duration
+        if (element instanceof HTMLVideoElement && element.videoWidth && meta.duration) {
+          meta.width = element.videoWidth; meta.height = element.videoHeight
+          const count = meta.duration < 4 ? 2 : 4
+          for (let i = 0; i < count; i++) {
+            element.currentTime = meta.duration * (i + 0.5) / count
+            await mediaEvent(element, 'seeked')
+            const still = await jpegStill(element, element.videoWidth, element.videoHeight, 1024)
+            if (still) frames.push(still)
+          }
+        }
+      } finally { element.removeAttribute('src'); element.load(); URL.revokeObjectURL(url) }
+    }
+  } catch { /* The file is still attached; the model just gets no picture of it. */ }
+  return { frames, meta }
+}
+
+interface PendingFile { key: string; name: string; bytes: number; status: 'processing' | 'ready' | 'error'; item?: MediaItem; preview?: string; error?: string }
+
+/** A file in a message: pictures, video and sound play inline, anything else is a card that can be saved. */
+function FileChip({ item }: { item: MediaItem }) {
+  const { perform, notify } = useWorkspace()
+  const Icon = kindIcon(item)
+  return <div className="file-chip"><span className="file-chip-icon"><Icon size={18} /></span><div><strong title={item.name}>{item.name}</strong><span>{item.label || item.kind} · {fileSize(item.bytes)}{item.pages ? ` · ${item.pages} pages` : ''}{item.duration ? ` · ${Math.round(item.duration)} s` : ''}</span></div><button className="icon-button" aria-label={`Save a copy of ${item.name}`} onClick={async () => { if (await perform<boolean>('media:save', item.id)) notify('File saved.') }}><ArrowDownToLine size={14} /></button><button className="icon-button" aria-label={`Show ${item.name} in folder`} onClick={() => void perform('media:reveal', item.id)}><FolderOpen size={14} /></button></div>
+}
+function Attachments({ items }: { items: MediaItem[] }) {
+  const [open, setOpen] = useState<string | null>(null)
+  const pictures = items.filter(i => i.kind === 'image')
+  const others = items.filter(i => i.kind !== 'image')
+  return <div className="attachments">{pictures.length > 0 && <div className="attachment-pictures">{pictures.map(item => <button type="button" key={item.id} className={open === item.id ? 'open' : ''} aria-label={`${open === item.id ? 'Shrink' : 'Enlarge'} ${item.name}`} onClick={() => setOpen(open === item.id ? null : item.id)}><img src={`rbx-media://${item.id}`} alt={item.name} /></button>)}</div>}
+    {others.map(item => item.kind === 'video' ? <figure className="media-card attachment-video" key={item.id}><video src={`rbx-media://${item.id}`} controls playsInline preload="metadata" aria-label={item.name} /><figcaption><span>{item.name}</span><small>{fileSize(item.bytes)}</small></figcaption></figure>
+      : item.kind === 'audio' ? <div className="attachment-audio" key={item.id}><FileChip item={item} /><audio src={`rbx-media://${item.id}`} controls preload="metadata" aria-label={item.name} /></div>
+      : <FileChip key={item.id} item={item} />)}</div>
 }
 
 function Conversations({ open }: { open: (id: string) => void }) {
@@ -265,12 +361,55 @@ function Chat({ sessionId, back }: { sessionId: string; back: () => void }) {
   const exact = suggestions.length === 1 && typed.toLowerCase() === `/${suggestions[0].name}`
   useEffect(() => { if (keepBottom.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [session.messages.length, session.messages.at(-1)?.content, approvals.length])
   useEffect(() => setPick(0), [suggestions.length])
-  const submit = async (e?: React.FormEvent) => {
-    e?.preventDefault(); if (!content.trim() || sending) return
-    setSending(true); keepBottom.current = true
-    const sent = await perform('session:send', { id: sessionId, content })
-    if (sent) setContent(''); setSending(false)
+  const [files, setFiles] = useState<PendingFile[]>([])
+  const [dragging, setDragging] = useState(false)
+  const picker = useRef<HTMLInputElement>(null)
+  const filesRef = useRef<PendingFile[]>([])
+  filesRef.current = files
+  const removed = useRef(new Set<string>())
+  // Files attached but never sent are deleted when the conversation is left.
+  useEffect(() => () => { for (const file of filesRef.current) { if (file.preview) URL.revokeObjectURL(file.preview); if (file.item) void window.rbx.invoke('attachment:discard', file.item.id).catch(() => {}) } }, [])
+  const addFiles = (list: File[]) => {
+    const room = MAX_ATTACHMENTS - filesRef.current.length
+    if (!list.length) return
+    if (list.length > room) notify(`Up to ${MAX_ATTACHMENTS} files per message.`)
+    for (const file of list.slice(0, Math.max(0, room))) {
+      const key = uid()
+      const name = file.name || `pasted-${new Date().toISOString().replace(/[:.]/g, '-')}.${(file.type.split('/')[1] || 'bin').replace('jpeg', 'jpg').replace(/[^a-z0-9]/g, '')}`
+      const preview = file.type.startsWith('image/') && file.type !== 'image/svg+xml' ? URL.createObjectURL(file) : undefined
+      setFiles(current => [...current, { key, name, bytes: file.size, status: 'processing', preview }])
+      void (async () => {
+        try {
+          const path = window.rbx.pathForFile(file)
+          const { frames, meta } = await prepareFile(file)
+          const item = await window.rbx.invoke<MediaItem>('attachment:add', path ? { path, name, frames, meta } : { data: new Uint8Array(await file.arrayBuffer()), name, frames, meta })
+          if (removed.current.has(key)) { void window.rbx.invoke('attachment:discard', item.id).catch(() => {}); return }
+          setFiles(current => current.map(f => f.key === key ? { ...f, status: 'ready', item } : f))
+        } catch (error) { setFiles(current => current.map(f => f.key === key ? { ...f, status: 'error', error: cleanError(error) } : f)) }
+      })()
+    }
   }
+  const removeFile = (file: PendingFile) => {
+    removed.current.add(file.key)
+    if (file.preview) URL.revokeObjectURL(file.preview)
+    if (file.item) void window.rbx.invoke('attachment:discard', file.item.id).catch(() => {})
+    setFiles(current => current.filter(f => f.key !== file.key))
+  }
+  const preparing = files.some(f => f.status === 'processing')
+  const ready = files.filter(f => f.status === 'ready' && f.item)
+  const canSend = (!!content.trim() || ready.length > 0) && !preparing
+  const submit = async (e?: React.FormEvent) => {
+    e?.preventDefault(); if (!canSend || sending) return
+    setSending(true); keepBottom.current = true
+    const sent = await perform('session:send', { id: sessionId, content, attachments: ready.map(f => f.item!.id) })
+    if (sent) { setContent(''); for (const file of filesRef.current) if (file.preview) URL.revokeObjectURL(file.preview); setFiles([]) }
+    setSending(false)
+  }
+  const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer.types).includes('Files')
+  const dragOver = (e: React.DragEvent) => { if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; if (!dragging) setDragging(true) }
+  const dragLeave = (e: React.DragEvent) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false) }
+  const drop = (e: React.DragEvent) => { if (!hasFiles(e)) return; e.preventDefault(); setDragging(false); addFiles(Array.from(e.dataTransfer.files)) }
+  const paste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => { const pasted = Array.from(e.clipboardData.files); if (pasted.length) { e.preventDefault(); addFiles(pasted) } }
   const complete = (command: (typeof SLASH_COMMANDS)[number]) => setContent(`/${command.name} `)
   const keys = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (suggestions.length && !exact) {
@@ -287,13 +426,13 @@ function Chat({ sessionId, back }: { sessionId: string; back: () => void }) {
     ? ['Review my game’s scripts for security and performance problems, then fix the serious ones.', 'Plan a new gameplay feature, split it across the team, and build it.', 'Inspect the connected Studio and tell me what the project contains.']
     : agent.mcpIds.includes('blender') && !agent.mcpIds.includes('roblox') ? ['Look at my Blender scene and tell me what is in it.', 'Render a turntable preview of the model I have open.', 'Animate a short idle loop for this rig and show me a preview.'] : ['Inspect the connected Studio and explain the project structure.', 'Help me plan a new Roblox gameplay system.', 'Review the current scripts for bugs and security issues.']
   const nameOf = (id?: string) => state.agents.find(a => a.id === id)?.name
-  return <div className="chat-layout"><header className="chat-header"><button className="icon-button" aria-label="Back to conversations" onClick={back}><ArrowLeft size={19} /></button><div className="mini-avatar" style={{ color: agent.color, backgroundColor: `${agent.color}15` }}><AgentIcon name={agent.name} size={20} /></div><div><h2>{agent.name}</h2><span>{provider?.name || 'No provider'} · {model || 'No model selected'}{effort ? ` · ${effort} effort` : ''}</span></div><Badge tone={active ? 'green' : 'neutral'}>{session.status}</Badge><button className="icon-button" aria-label="Configure agent" onClick={() => setEditing(true)}><SlidersHorizontal size={18} /></button></header><div className="chat-scroll" ref={scroll} onScroll={() => { const el = scroll.current; if (el) keepBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120 }}>
+  return <div className={`chat-layout ${dragging ? 'dragging' : ''}`} onDragEnter={dragOver} onDragOver={dragOver} onDragLeave={dragLeave} onDrop={drop}>{dragging && <div className="drop-overlay" aria-hidden="true"><Paperclip size={30} /><strong>Drop files to attach them</strong><span>Images, video, audio, PDF, Office documents, code, archives, 3D models and more</span></div>}<header className="chat-header"><button className="icon-button" aria-label="Back to conversations" onClick={back}><ArrowLeft size={19} /></button><div className="mini-avatar" style={{ color: agent.color, backgroundColor: `${agent.color}15` }}><AgentIcon name={agent.name} size={20} /></div><div><h2>{agent.name}</h2><span>{provider?.name || 'No provider'} · {model || 'No model selected'}{effort ? ` · ${effort} effort` : ''}</span></div><Badge tone={active ? 'green' : 'neutral'}>{session.status}</Badge><button className="icon-button" aria-label="Configure agent" onClick={() => setEditing(true)}><SlidersHorizontal size={18} /></button></header><div className="chat-scroll" ref={scroll} onScroll={() => { const el = scroll.current; if (el) keepBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120 }}>
     {session.messages.length === 0 && <div className="chat-welcome"><div className="chat-welcome-avatar" style={{ color: agent.color }}><AgentIcon name={agent.name} size={34} /></div><div className="eyebrow">{agent.role}</div><h1>Let’s build something.</h1><p>{agent.description}</p><div className="starter-prompts">{starters.map(text => <button key={text} onClick={() => setContent(text)}>{text}<ArrowUp size={15} className="diagonal" /></button>)}</div></div>}
-    {session.messages.map(message => message.role === 'tool' ? <React.Fragment key={message.id}><details className={`tool-message ${message.agentId ? 'worker' : ''}`}><summary><Terminal size={14} /><span>{message.content.split('\n')[0]}</span><ChevronDown size={13} /></summary><pre>{message.content.split('\n').slice(1).join('\n')}</pre></details>{message.media?.map(item => <MediaCard key={item.id} item={item} />)}</React.Fragment> : message.role === 'system' ? <div className={`system-message ${message.kind === 'command' ? 'command' : ''}`} key={message.id}>{message.kind === 'command' ? <Command size={16} /> : <CircleHelp size={16} />}<p>{message.content}</p></div> : <article className={`chat-message ${message.role} ${message.kind || ''}`} key={message.id}><div className="message-avatar" style={message.role === 'assistant' ? { color: agent.color } : undefined}>{message.role === 'assistant' ? <AgentIcon name={agent.name} size={18} /> : 'Y'}</div><div className="message-body"><div className="message-label"><strong>{message.role === 'user' ? 'You' : agent.name}</strong>{message.kind === 'btw' && <Badge tone="purple">Side question</Badge>}{message.kind === 'queued' && <Badge tone="orange">Queued · delivered before the next step</Badge>}<span>{new Date(message.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>{message.role === 'assistant' && message.content && <button className="icon-button" aria-label="Copy response" onClick={async () => { try { await navigator.clipboard.writeText(message.content); notify('Response copied.') } catch { notify('Clipboard access is unavailable.') } }}><Copy size={13} /></button>}</div><div className="markdown"><ReactMarkdown>{message.content || (active ? 'Working…' : '')}</ReactMarkdown></div>{message.media?.map(item => <MediaCard key={item.id} item={item} />)}</div></article>)}
+    {session.messages.map(message => message.role === 'tool' ? <React.Fragment key={message.id}><details className={`tool-message ${message.agentId ? 'worker' : ''}`}><summary><Terminal size={14} /><span>{message.content.split('\n')[0]}</span><ChevronDown size={13} /></summary><pre>{message.content.split('\n').slice(1).join('\n')}</pre></details>{message.media?.map(item => <MediaCard key={item.id} item={item} />)}</React.Fragment> : message.role === 'system' ? <div className={`system-message ${message.kind === 'command' ? 'command' : ''}`} key={message.id}>{message.kind === 'command' ? <Command size={16} /> : <CircleHelp size={16} />}<p>{message.content}</p></div> : <article className={`chat-message ${message.role} ${message.kind || ''}`} key={message.id}><div className="message-avatar" style={message.role === 'assistant' ? { color: agent.color } : undefined}>{message.role === 'assistant' ? <AgentIcon name={agent.name} size={18} /> : 'Y'}</div><div className="message-body"><div className="message-label"><strong>{message.role === 'user' ? 'You' : agent.name}</strong>{message.kind === 'btw' && <Badge tone="purple">Side question</Badge>}{message.kind === 'queued' && <Badge tone="orange">Queued · delivered before the next step</Badge>}<span>{new Date(message.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>{message.role === 'assistant' && message.content && <button className="icon-button" aria-label="Copy response" onClick={async () => { try { await navigator.clipboard.writeText(message.content); notify('Response copied.') } catch { notify('Clipboard access is unavailable.') } }}><Copy size={13} /></button>}</div>{(message.content || message.role !== 'user' || !message.media?.length) && <div className="markdown"><ReactMarkdown>{message.content || (active ? 'Working…' : '')}</ReactMarkdown></div>}{message.role === 'user' && message.media?.length ? <Attachments items={message.media} /> : message.media?.map(item => <MediaCard key={item.id} item={item} />)}</div></article>)}
     {active && session.messages.at(-1)?.role !== 'assistant' && approvals.length === 0 && working.length === 0 && <div className="thinking"><LoaderCircle size={15} className="spin" />{agent.name} is working…</div>}
     {active && working.length > 0 && <div className="team-banner"><LoaderCircle size={15} className="spin" /><span>Working now:</span>{working.map(t => <Badge key={t.id} tone="purple">{t.agentName}</Badge>)}</div>}
     {approvals.map(approval => approval.kind === 'create-agent' ? <div className="approval-card create-agent" key={approval.id}><div><Users size={20} /><h3>Create a new agent?</h3><Badge tone="orange">Always needs your approval</Badge></div><p>{nameOf(approval.agentId) || agent.name} wants to add <strong>{String(approval.args.name)}</strong> to your team. {String(approval.args.reason || '')}</p><dl className="spec-list">{[['Specialty', approval.args.role], ['Description', approval.args.description], ['Model', approval.args.model], ['Access', approval.args.access], ['Studio tools', approval.args.studio_tools ? 'Yes' : 'No'], ['Skills', Array.isArray(approval.args.skills) ? approval.args.skills.join(', ') || 'None' : '']].map(([label, value]: unknown[]) => <React.Fragment key={String(label)}><dt>{String(label)}</dt><dd>{String(value)}</dd></React.Fragment>)}</dl><details className="spec-prompt"><summary>System prompt</summary><pre>{String(approval.args.system_prompt)}</pre></details><div className="approval-actions"><Button onClick={() => void perform('approval:decide', { id: approval.id, allow: false })}>Decline</Button><Button variant="primary" onClick={() => void perform('approval:decide', { id: approval.id, allow: true })}><Check size={15} />Create agent</Button></div></div> : <div className="approval-card" key={approval.id}><div><Shield size={20} /><h3>{approval.serverId === 'media' ? 'Send an image to the model' : <>Approve {approval.serverId === 'blender' ? 'a Blender' : 'a Studio'} action</>}</h3><Badge tone="orange">Your approval needed</Badge></div><p>{nameOf(approval.agentId) || agent.name} wants to run <code>{approval.tool}</code>.</p>{typeof approval.args.code === 'string' ? <><p className="muted">Python that will run inside Blender:</p><pre>{approval.args.code}</pre>{Object.keys(approval.args).length > 1 && <pre>{JSON.stringify({ ...approval.args, code: undefined }, null, 2)}</pre>}</> : <pre>{JSON.stringify(approval.args, null, 2)}</pre>}<div className="approval-actions"><Button onClick={() => void perform('approval:decide', { id: approval.id, allow: false })}>Deny</Button><Button variant="primary" onClick={() => void perform('approval:decide', { id: approval.id, allow: true })}><Check size={15} />Approve once</Button></div></div>)}<div ref={bottom} />
-    </div><form className="composer-area" onSubmit={submit}>{suggestions.length > 0 && !exact && <div className="slash-menu" role="listbox" aria-label="Commands">{suggestions.map((command, index) => <button type="button" role="option" aria-selected={index === pick} className={index === pick ? 'selected' : ''} key={command.name} onMouseDown={e => { e.preventDefault(); complete(command) }}><code>{command.usage}</code><span>{command.description}</span></button>)}</div>}<div className="composer"><textarea aria-label="Message your agent" placeholder={active ? `Send ${agent.name} an update. It is delivered before the next step. /btw asks a side question.` : `Ask ${agent.name} to build, inspect, or explore… (type / for commands)`} rows={3} value={content} onChange={e => setContent(e.target.value)} onKeyDown={keys} /><div className="composer-footer"><div className="composer-config"><label className="mini-select"><Cpu size={14} /><select aria-label="Model" value={model} disabled={!provider} onChange={e => void setModel(e.target.value)}>{!models.length && <option value="">No model</option>}{models.map(m => <option key={m} value={m}>{m}</option>)}</select></label><label className="mini-select"><Zap size={14} /><select aria-label="Reasoning effort" value={effort} onChange={e => void setEffort(e.target.value)}><option value="">Default effort</option>{EFFORTS.map(level => <option key={level} value={level}>{level[0].toUpperCase() + level.slice(1)} effort</option>)}</select></label></div><div><span>{agent.skillIds.length} skills</span>{active && <Button type="button" variant="danger" onClick={() => void perform('session:stop', sessionId)}><Square size={13} fill="currentColor" />Stop</Button>}<Button type="submit" variant="primary send" disabled={!content.trim()} busy={sending} aria-label="Send message"><ArrowUp size={18} /></Button></div></div></div><div className="composer-hint"><span><Shield size={11} />{agent.orchestrator ? 'Each worker follows its own access mode · New agents always need your approval' : agent.permission === 'unrestricted' ? 'Unrestricted access · No approval prompts' : agent.permission === 'read-only' ? 'Read-only agent' : 'Changes require your approval'}</span><span>Enter to send · Shift + Enter for new line · / for commands</span></div>{provider?.kind === 'chatgpt' && <div className="chatgpt-usage">Using ChatGPT plan · {provider.account}<button type="button" onClick={() => void perform('external:open', 'https://chatgpt.com/settings/usage')}>Manage usage<ExternalLink size={11} /></button></div>}</form>{editing && <AgentEditor agent={agent} close={() => setEditing(false)} />}</div>
+    </div><form className="composer-area" onSubmit={submit}>{suggestions.length > 0 && !exact && <div className="slash-menu" role="listbox" aria-label="Commands">{suggestions.map((command, index) => <button type="button" role="option" aria-selected={index === pick} className={index === pick ? 'selected' : ''} key={command.name} onMouseDown={e => { e.preventDefault(); complete(command) }}><code>{command.usage}</code><span>{command.description}</span></button>)}</div>}<div className="composer">{files.length > 0 && <div className="attachment-tray" aria-label="Attached files">{files.map(file => { const Icon = file.item ? kindIcon(file.item) : FileIcon; return <div className={`pending-file ${file.status}`} key={file.key} title={file.error || file.name}>{file.preview ? <img src={file.preview} alt="" /> : <span className="pending-icon"><Icon size={17} /></span>}<div><strong>{file.name}</strong><span>{file.status === 'processing' ? 'Preparing…' : file.status === 'error' ? file.error : `${file.item?.label || file.item?.kind} · ${fileSize(file.bytes)}`}</span></div>{file.status === 'processing' ? <LoaderCircle size={14} className="spin" /> : <button type="button" className="icon-button" aria-label={`Remove ${file.name}`} onClick={() => removeFile(file)}><X size={13} /></button>}</div> })}</div>}<textarea aria-label="Message your agent" placeholder={active ? `Send ${agent.name} an update. It is delivered before the next step. /btw asks a side question.` : `Ask ${agent.name} to build, inspect, or explore… (type / for commands, drop or paste files)`} rows={3} value={content} onChange={e => setContent(e.target.value)} onKeyDown={keys} onPaste={paste} /><div className="composer-footer"><div className="composer-config"><input ref={picker} type="file" multiple hidden onChange={e => { addFiles(Array.from(e.target.files || [])); e.target.value = '' }} /><button type="button" className="icon-button attach-button" aria-label="Attach files" title="Attach files (or drop / paste them)" disabled={files.length >= MAX_ATTACHMENTS} onClick={() => picker.current?.click()}><Paperclip size={15} /></button><label className="mini-select"><Cpu size={14} /><select aria-label="Model" value={model} disabled={!provider} onChange={e => void setModel(e.target.value)}>{!models.length && <option value="">No model</option>}{models.map(m => <option key={m} value={m}>{m}</option>)}</select></label><label className="mini-select"><Zap size={14} /><select aria-label="Reasoning effort" value={effort} onChange={e => void setEffort(e.target.value)}><option value="">Default effort</option>{EFFORTS.map(level => <option key={level} value={level}>{level[0].toUpperCase() + level.slice(1)} effort</option>)}</select></label></div><div><span>{agent.skillIds.length} skills</span>{active && <Button type="button" variant="danger" onClick={() => void perform('session:stop', sessionId)}><Square size={13} fill="currentColor" />Stop</Button>}<Button type="submit" variant="primary send" disabled={!canSend} busy={sending} aria-label="Send message"><ArrowUp size={18} /></Button></div></div></div><div className="composer-hint"><span><Shield size={11} />{agent.orchestrator ? 'Each worker follows its own access mode · New agents always need your approval' : agent.permission === 'unrestricted' ? 'Unrestricted access · No approval prompts' : agent.permission === 'read-only' ? 'Read-only agent' : 'Changes require your approval'}</span><span>Enter to send · Shift + Enter for new line · / for commands</span></div>{provider?.kind === 'chatgpt' && <div className="chatgpt-usage">Using ChatGPT plan · {provider.account}<button type="button" onClick={() => void perform('external:open', 'https://chatgpt.com/settings/usage')}>Manage usage<ExternalLink size={11} /></button></div>}</form>{editing && <AgentEditor agent={agent} close={() => setEditing(false)} />}</div>
 }
 
 function ActivityPage() {

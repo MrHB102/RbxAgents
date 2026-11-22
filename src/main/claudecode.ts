@@ -163,7 +163,9 @@ export class ClaudeCode {
       writeFileSync(system, input.turns.filter(t => t.role === 'system').map(t => t.content).join('\n\n'))
       writeFileSync(config, JSON.stringify({ mcpServers: { rbx: { type: 'http', url: `http://127.0.0.1:${port}/mcp`, headers: { Authorization: `Bearer ${token}` } } } }))
       const images = input.turns.flatMap(t => t.images || [])
-      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', ...(images.length ? ['--input-format', 'stream-json'] : []), '--model', input.model,
+      const documents = input.turns.flatMap(t => t.documents || [])
+      const rich = images.length > 0 || documents.length > 0
+      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', ...(rich ? ['--input-format', 'stream-json'] : []), '--model', input.model,
         '--system-prompt-file', system, '--tools', '', '--strict-mcp-config', '--mcp-config', config, '--allowedTools', 'mcp__rbx__*',
         '--permission-mode', 'dontAsk', '--disable-slash-commands', '--no-session-persistence', '--setting-sources', 'project', ...(input.effort ? ['--effort', input.effort] : [])]
       // An empty working folder keeps project settings, memory files, and hooks from reaching the run.
@@ -171,7 +173,8 @@ export class ClaudeCode {
       touch()
       child.stdin!.on('error', () => {})
       const prompt = renderPrompt(input.turns)
-      child.stdin!.end(images.length ? JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: prompt }, ...images.map(anthropicImage)] } }) + '\n' : prompt)
+      const pdfs = documents.map(d => ({ type: 'document', title: d.name.slice(0, 200), source: { type: 'base64', media_type: d.mimeType, data: d.data } }))
+      child.stdin!.end(rich ? JSON.stringify({ type: 'user', message: { role: 'user', content: [...pdfs, { type: 'text', text: prompt }, ...images.map(anthropicImage)] } }) + '\n' : prompt)
       let stderr = ''
       child.stderr!.on('data', chunk => { stderr = (stderr + chunk).slice(-4000) })
       let text = ''
